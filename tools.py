@@ -196,4 +196,37 @@ TOOLS_SCHEMA = [
             },
         },
     },
+    {
+        "type": "function",
+        "function": {
+            "name": "await_job",
+            "description": (
+                "Register intent to call another tool once a specific background job completes. "
+                "Use this at any point in the conversation when you realize a follow-up tool call "
+                "needs results from a still-running job. Do NOT call the follow-up tool now with "
+                "guessed or placeholder args — register here and you will be reminded with the real "
+                "result when the job completes, at which point you must call it with concrete arguments. "
+                "If the job has already completed, its result is visible in the conversation — call "
+                "the follow-up tool directly instead of using await_job."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {
+                        "type": "string",
+                        "description": "The job_id from the still-running background job to wait for.",
+                    },
+                    "followup_hint": {
+                        "type": "string",
+                        "description": (
+                            "Natural language: what tool to call and how to map the result to its args. "
+                            "Example: 'call get_activities with destination city and tag=couple'. "
+                            "If this is an intermediate step in a chain, also note the step after it."
+                        ),
+                    },
+                },
+                "required": ["job_id", "followup_hint"],
+            },
+        },
+    },
 ]
