@@ -1,0 +1,334 @@
+import asyncio
+import json
+import logging
+import os
+import threading
+import uuid
+from queue import Queue
+
+import openai
+from dotenv import load_dotenv
+
+from .await_job import AWAIT_JOB_SCHEMA
+from .prompts import BASE_SYSTEM_PROMPTS
+from .schema import UseCase
+
+load_dotenv()
+
+log = logging.getLogger("async_tools")
+
+
+class AsyncEngine:
+    """
+    Core async tool-calling engine.
+
+    Instantiated once with a UseCase and an injection_mode. Owns all
+    mutable conversation state and the OpenAI loop, async dispatch,
+    injection strategies, and SSE broadcast.
+    """
+
+    def __init__(self, use_case: UseCase, injection_mode: str = "tool"):
+        self.use_case = use_case
+        self.injection_mode = injection_mode
+
+        # Compose system prompt: base (async mechanics) + use-case (domain)
+        base = BASE_SYSTEM_PROMPTS[injection_mode]
+        self._system_prompt = base + "\n\n---\n\n" + use_case.system_prompt
+
+        # Full tool schema list: domain tools + framework-owned await_job
+        self._tools_schema = list(use_case.tool_schemas) + [AWAIT_JOB_SCHEMA]
+
+        # OpenAI client
+        self._client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        # -----------------------------------------------------------------
+        # Mutable state (single-user demo)
+        # -----------------------------------------------------------------
+        self.messages: list = [{"role": "system", "content": self._system_prompt}]
+        self.pending_tools: dict = {}       # job_id -> {name, args}
+        self.results_queue: Queue = Queue() # background threads drop results here
+        self._lock: threading.Lock = threading.Lock()
+        self.deferred_hints: dict = {}      # job_id -> list[str] of follow-up hints
+
+        # SSE: one asyncio.Queue per connected browser tab
+        self._sse_loop: asyncio.AbstractEventLoop = None
+        self._sse_clients: list = []
+
+        # When False, background threads deposit results into the queue but do NOT
+        # auto-spawn _run_injection. Set to False in tests that inspect the queue
+        # directly to avoid a race between the injection thread and the test.
+        self._auto_inject: bool = True
+
+    # ------------------------------------------------------------------
+    # SSE
+    # ------------------------------------------------------------------
+
+    def push_event(self, event_type: str, data: dict):
+        """Thread-safe push to all connected SSE clients."""
+        payload = json.dumps({"type": event_type, "data": data})
+        if self._sse_loop:
+            for q in list(self._sse_clients):
+                self._sse_loop.call_soon_threadsafe(q.put_nowait, payload)
+
+    # ------------------------------------------------------------------
+    # Async tool machinery
+    # ------------------------------------------------------------------
+
+    def fire_tool_async(self, tool_name: str, tool_args: dict) -> str:
+        """Spawn a background thread for a slow tool. Returns job JSON immediately."""
+        job_id = uuid.uuid4().hex[:8]
+        tool_fn = self.use_case.tool_functions[tool_name]
+        log.info("TOOL START  job=%s  tool=%s  args=%s", job_id, tool_name, json.dumps(tool_args))
+
+        def run():
+            log.debug("BG THREAD   job=%s  tool=%s  executing...", job_id, tool_name)
+            try:
+                result = tool_fn(tool_args)
+                preview = result[:120] + "..." if len(result) > 120 else result
+                log.info("BG DONE     job=%s  tool=%s  result_preview=%r", job_id, tool_name, preview)
+                self.results_queue.put((job_id, tool_name, tool_args, result, None))
+            except Exception as e:
+                log.error("BG FAILED   job=%s  tool=%s  error=%s", job_id, tool_name, e)
+                self.results_queue.put((job_id, tool_name, tool_args, None, str(e)))
+            if self._auto_inject:
+                threading.Thread(target=self._run_injection, daemon=True).start()
+
+        threading.Thread(target=run, daemon=True).start()
+        self.pending_tools[job_id] = {"name": tool_name, "args": tool_args}
+        return json.dumps({"job_id": job_id, "status": "started", "tool": tool_name, "args": tool_args})
+
+    def call_openai(self):
+        """Call the OpenAI chat completions API with current messages."""
+        log.info("OPENAI CALL  messages=%d  (last role: %s)", len(self.messages), self.messages[-1]["role"])
+        response = self._client.chat.completions.create(
+            model="gpt-4o",
+            tools=self._tools_schema,
+            messages=self.messages,
+        )
+        msg = response.choices[0].message
+        tool_names = [tc.function.name for tc in (msg.tool_calls or [])]
+        content_preview = (msg.content or "")[:80].replace("\n", " ")
+        log.info("OPENAI RESP  content=%r  tool_calls=%s", content_preview, tool_names)
+        return msg
+
+    def handle_response(self, msg) -> str:
+        """Process an OpenAI response. Returns the assistant text to display."""
+        tool_names = [tc.function.name for tc in (msg.tool_calls or [])]
+        log.debug("HANDLE RESP  has_content=%s  tool_calls=%s", bool(msg.content), tool_names)
+        self.messages.append(msg.model_dump(exclude_none=True))
+
+        collected = []
+        if msg.content:
+            collected.append(msg.content)
+
+        if msg.tool_calls:
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                tool_args = json.loads(tc.function.arguments)
+                tool_call_id = tc.id
+
+                if tool_name in self.use_case.slow_tools:
+                    log.info("DISPATCH     slow tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                    content = self.fire_tool_async(tool_name, tool_args)
+
+                elif tool_name == "await_job":
+                    job_id = tool_args.get("job_id", "")
+                    hint   = tool_args.get("followup_hint", "")
+                    if job_id in self.pending_tools and hint:
+                        self.deferred_hints.setdefault(job_id, []).append(hint)
+                        log.info("AWAIT_JOB    registered  job=%s  hint=%r", job_id, hint)
+                        content = json.dumps({
+                            "status": "registered",
+                            "job_id": job_id,
+                            "message": "Follow-up intent recorded. You will be reminded when this job completes.",
+                        })
+                    else:
+                        reason = "job not in pending_tools" if job_id not in self.pending_tools else "empty hint"
+                        log.warning("AWAIT_JOB    REJECTED  job=%r  reason=%s  active_jobs=%s",
+                                    job_id, reason, list(self.pending_tools.keys()))
+                        content = json.dumps({
+                            "status": "error",
+                            "message": (
+                                f"No active job with id '{job_id}'. "
+                                "If this job already completed, its result is in the conversation — "
+                                "call the follow-up tool directly with that result."
+                            ),
+                        })
+
+                else:
+                    log.info("DISPATCH     instant tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                    content = self.use_case.tool_functions[tool_name](tool_args)
+                    preview = content[:80] + "..." if len(content) > 80 else content
+                    log.debug("INSTANT RES  tool=%s  result=%r", tool_name, preview)
+
+                self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+
+            log.debug("FOLLOWUP     making follow-up OpenAI call after %d tool result(s)", len(msg.tool_calls))
+            followup = self.call_openai()
+            collected.append(self.handle_response(followup))
+
+        return "\n\n".join(filter(None, collected))
+
+    # ------------------------------------------------------------------
+    # Injection strategies
+    # ------------------------------------------------------------------
+
+    def collect_finished_results(self) -> list:
+        """Drain results_queue and return all completed jobs as a list of tuples."""
+        finished = []
+        while not self.results_queue.empty():
+            try:
+                finished.append(self.results_queue.get_nowait())
+            except Exception:
+                break
+        return finished
+
+    def _inject_finished(self, finished: list):
+        """Append completed job results into messages using self.injection_mode.
+
+        "user"   — single {"role": "user",   "content": "(System) Job X completed: ..."}
+        "system" — single {"role": "system", "content": "(System) Job X completed: ..."}
+        "tool"   — per-job synthetic assistant tool_call + tool result pair
+        """
+        log.info("INJECT  mode=%s  jobs=%d  pending_before=%s",
+                 self.injection_mode, len(finished), list(self.pending_tools.keys()))
+
+        if self.injection_mode == "tool":
+            for job_id, tool_name, tool_args, result, error in finished:
+                if error:
+                    log.error("JOB FAILED   job=%s  tool=%s  error=%s", job_id, tool_name, error)
+                else:
+                    preview = result[:120] + "..." if len(result) > 120 else result
+                    log.info("JOB DONE     job=%s  tool=%s  result_preview=%r", job_id, tool_name, preview)
+
+                # Synthetic assistant message that "called" this tool
+                call_id = f"call_{uuid.uuid4().hex[:8]}"
+                self.messages.append({
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": tool_name,
+                            "arguments": json.dumps(tool_args),
+                        },
+                    }],
+                })
+                # Tool result (or error) paired with that call
+                self.messages.append({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": result if result is not None else f"ERROR: {error}",
+                })
+
+                hints = self.deferred_hints.pop(job_id, [])
+                if hints:
+                    log.info("HINT FIRE    job=%s  %d hint(s): %s", job_id, len(hints), hints)
+                for hint in hints:
+                    if not error:
+                        self.messages.append({"role": "system", "content":
+                            f"You had planned a follow-up: \"{hint}\". "
+                            f"The result is now available above — call the appropriate tool(s)."})
+                    else:
+                        log.warning("HINT FAIL    job=%s  hint=%r  skipped due to failure", job_id, hint)
+                        self.messages.append({"role": "system", "content":
+                            f"Follow-up \"{hint}\" cannot proceed — the tool failed. "
+                            f"Inform the user and ask how to proceed."})
+
+                self.pending_tools.pop(job_id, None)
+
+            if self.pending_tools:
+                still = [f"{v['name']}({json.dumps(v['args'])})" for v in self.pending_tools.values()]
+                log.info("STILL PEND   %s", still)
+                self.messages.append({"role": "system",
+                                      "content": f"Still running in the background: {', '.join(still)}"})
+
+        else:  # "user" or "system"
+            lines = []
+            for job_id, tool_name, tool_args, result, error in finished:
+                if error:
+                    log.error("JOB FAILED   job=%s  tool=%s  error=%s", job_id, tool_name, error)
+                    lines.append(
+                        f"(System) Job {job_id} FAILED: {tool_name}({json.dumps(tool_args)}) → {error}")
+                else:
+                    preview = result[:120] + "..." if len(result) > 120 else result
+                    log.info("JOB DONE     job=%s  tool=%s  result_preview=%r", job_id, tool_name, preview)
+                    lines.append(
+                        f"(System) Job {job_id} completed: {tool_name}({json.dumps(tool_args)}) → {result}")
+
+                hints = self.deferred_hints.pop(job_id, [])
+                if hints:
+                    log.info("HINT FIRE    job=%s  %d hint(s): %s", job_id, len(hints), hints)
+                for hint in hints:
+                    if not error:
+                        lines.append(
+                            f"(System) You had planned a follow-up after job {job_id}: \"{hint}\". "
+                            f"Now that the result is available above, call the appropriate tool(s) with "
+                            f"correct arguments. If the original user request implies further steps beyond "
+                            f"this follow-up, also register await_job for the next dependency.")
+                    else:
+                        log.warning("HINT FAIL    job=%s  hint=%r  skipped due to failure", job_id, hint)
+                        lines.append(
+                            f"(System) Note: Follow-up \"{hint}\" after job {job_id} cannot proceed — "
+                            f"job FAILED. Inform the user and ask how to proceed.")
+
+                self.pending_tools.pop(job_id, None)
+
+            if self.pending_tools:
+                still = [f"Job {jid} ({v['name']})" for jid, v in self.pending_tools.items()]
+                log.info("STILL PEND   %s", still)
+                lines.append(f"(System) Still pending: {', '.join(still)}")
+
+            injection = "\n".join(lines)
+            log.debug("INJECTION    message to OpenAI:\n%s", injection)
+            self.messages.append({"role": self.injection_mode, "content": injection})
+
+    def check_and_inject(self, history=None):
+        """Drain the results queue, inject all finished jobs, call OpenAI, return result.
+
+        Restores the method that existed in app.py (removed in the FastAPI migration)
+        so the test suite can exercise injection logic directly without going through
+        the threading machinery.
+
+        Args:
+            history: Optional list of message dicts. When provided, the assistant
+                     response is appended to it and the list is returned (backward-
+                     compatible with the old Gradio-era call signature). When None,
+                     returns the bot text string.
+
+        Must be called with self._lock already held (or in a single-threaded test context).
+        """
+        finished = self.collect_finished_results()
+        if not finished:
+            return history  # empty queue — return history unchanged (same object)
+        self._inject_finished(finished)
+        response = self.call_openai()
+        bot_text = self.handle_response(response)
+        if history is not None:
+            history.append({"role": "assistant", "content": bot_text})
+        return history
+
+    def _run_injection(self):
+        """Called from a background thread when a job completes."""
+        with self._lock:
+            finished = self.collect_finished_results()
+            if not finished:
+                return
+            self._inject_finished(finished)
+            response = self.call_openai()
+            bot_text = self.handle_response(response)
+
+        self.push_event("assistant", {"content": bot_text})
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    def reset(self):
+        """Clear conversation history (keep system prompt)."""
+        with self._lock:
+            self.messages.clear()
+            self.messages.append({"role": "system", "content": self._system_prompt})
+            self.pending_tools.clear()
+            self.deferred_hints.clear()

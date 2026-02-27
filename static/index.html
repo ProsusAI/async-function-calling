@@ -121,14 +121,14 @@
 </head>
 <body>
   <header>
-    <h1>Async Tools Demo</h1>
-    <p>Ask about <strong>hotels</strong>, <strong>activities</strong>, <strong>flights</strong> (Tokyo→Mumbai/Amsterdam), or <strong>weather</strong>. Results appear automatically.</p>
+    <h1 id="header-title">Async Tools Demo</h1>
+    <p id="header-subtitle">Results appear automatically via background async tool calls.</p>
   </header>
 
   <div id="chat"></div>
 
   <div id="input-row">
-    <input id="msg" type="text" placeholder="e.g. Find flights from Tokyo to Amsterdam" autofocus>
+    <input id="msg" type="text" placeholder="Ask me anything…" autofocus>
     <button id="send-btn" onclick="sendMessage()">Send</button>
     <button id="reset-btn" onclick="resetChat()" title="Clear conversation">Reset</button>
   </div>
@@ -138,6 +138,19 @@
     const msgInput = document.getElementById("msg");
     const sendBtn  = document.getElementById("send-btn");
     let thinkingEl = null;
+
+    // ── Load use-case config from server ──────────────────────────────────────
+
+    async function loadConfig() {
+      try {
+        const cfg = await fetch("/config").then(r => r.json());
+        if (cfg.display_name) document.getElementById("header-title").textContent = cfg.display_name;
+        if (cfg.placeholder)  msgInput.placeholder = cfg.placeholder;
+      } catch (_) {
+        // Server not yet ready; defaults remain
+      }
+    }
+    loadConfig();
 
     // ── SSE connection ────────────────────────────────────────────────────────
 
