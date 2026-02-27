@@ -1,26 +1,144 @@
 # Async Tool-Calling Demo
 
-A travel assistant chatbot that demonstrates **async LLM tool calling** — slow tools run in the background while the model continues the conversation, injecting results when ready.
+A travel assistant chatbot that demonstrates **async LLM tool calling** — slow tools run in the background while the model continues the conversation, and results are pushed to the browser via SSE when ready.
 
-See [claude_notes/README.md](claude_notes/README.md) for a deep-dive on the architecture.
+## Architecture
 
-## How It Works
+```
+tools.py          ← tool implementations + OpenAI schemas (no web framework)
+server.py         ← FastAPI backend: OpenAI loop + async dispatch + SSE push
+static/index.html ← browser UI: fetch + EventSource, vanilla JS
+experiments/      ← standalone scripts used to validate API behaviour
+```
 
-Tools are classified as **slow** or **instant** at definition time:
+### Tool classification
 
-- **Slow tools** (`get_hotels`, `get_flights`, `get_activities`): return a job ID immediately, run in a background thread, inject `(System) Job X completed: ...` when done
-- **Instant tools** (`get_weather`): run inline and return results normally
+Tools are classified as **slow** or **instant** at definition time (`tools.py`):
 
-The system prompt teaches the model this protocol — it acknowledges in-flight jobs, asks follow-up questions while tools run, and synthesizes results with context when they arrive.
+| Type | Tools | Behaviour |
+|------|-------|-----------|
+| Instant | `get_weather` | Runs inline; result returned synchronously in the same OpenAI turn |
+| Slow | `get_hotels`, `get_flights`, `get_activities` | Dispatched to a background thread; returns `{"job_id": ..., "status": "started"}` immediately |
+
+### Request flow
+
+```
+Browser POST /chat
+  → acquire _lock
+  → append user message
+  → call OpenAI  (LLM may dispatch slow tools → background threads start)
+  → handle_response() recurses until no tool calls remain
+  → release _lock
+  → push_event("assistant", ...) → SSE → browser renders bubble
+
+Background thread finishes
+  → results_queue.put(...)
+  → spawn _run_injection thread
+    → acquire _lock
+    → drain queue
+    → _inject_finished()   ← injection mode applied here
+    → call OpenAI
+    → handle_response()
+    → release _lock
+  → push_event("assistant", ...) → SSE → browser renders new bubble
+```
+
+### SSE (Server-Sent Events)
+
+The browser opens a single persistent `GET /stream` connection at page load. The server keeps it alive and writes `data: {...}\n\n` whenever anything happens. The browser's built-in `EventSource` API handles reconnection automatically. No polling, no timers.
+
+---
+
+## Injection modes
+
+When a background job completes, the result must be fed back into the LLM's message history. Three strategies are supported, selectable at startup via `--injection-mode`.
+
+### `user` — role=user message *(original, BUG-4)*
+
+```python
+{"role": "user", "content": "(System) Job abc123 completed: get_hotels(...) → Hotels: ..."}
+```
+
+The LLM sees job completions as if the user typed them. This causes confusion when a real user message arrives in the same turn — the LLM can lose track of which text is user speech vs. system data.
+
+### `system` — role=system message
+
+```python
+{"role": "system", "content": "(System) Job abc123 completed: get_hotels(...) → Hotels: ..."}
+```
+
+Semantically correct. Verified experimentally: mid-conversation `system` messages are accepted by the API, and the original system prompt's constraints are still honoured — the new message adds data without overriding existing instructions.
+
+### `tool` — synthetic tool call + result pair *(default)*
+
+For each completed job, two messages are appended:
+
+```python
+# 1. Synthetic assistant message that "called" the tool
+{"role": "assistant", "content": None, "tool_calls": [{
+    "id": "call_a1b2c3d4",
+    "type": "function",
+    "function": {"name": "get_hotels", "arguments": '{"city": "amsterdam"}'}
+}]}
+
+# 2. Paired tool result
+{"role": "tool", "tool_call_id": "call_a1b2c3d4", "content": "Hotels in Amsterdam: ..."}
+```
+
+The LLM reads this exactly like a synchronous tool call — no role confusion, no `(System)` prefix, no special instructions in the system prompt needed. The LLM is trained on this shape.
+
+**Dependent tool chaining in `tool` mode:**
+When the LLM dispatches a slow tool, it can register a follow-up intent with `await_job`:
+
+```
+LLM fires get_flights(tokyo, amsterdam)  → job_id = "abc123"
+LLM calls await_job(job_id="abc123", followup_hint="call get_hotels(city=amsterdam)")
+  → stored in deferred_hints["abc123"]
+```
+
+When the job completes, `_inject_finished` appends the synthetic tool pair **plus** a `system` reminder:
+
+```
+[assistant] tool_call: get_flights({"origin": "tokyo", "destination": "amsterdam"})
+[tool]      Flights from Tokyo to Amsterdam: KLM $680 nonstop, ...
+[system]    You had planned a follow-up: "call get_hotels(city=amsterdam)".
+            The result is now available above — call the appropriate tool(s).
+```
+
+OpenAI is then called. The LLM sees its completed result alongside its own earlier intent and immediately calls `get_hotels`. Without the hint the LLM would have to re-derive intent from context, which is unreliable across long conversations.
+
+---
 
 ## Running
 
 ```bash
-python app.py    # Gradio web UI
-python main.py   # Terminal version
+# Default (tool mode — recommended)
+python server.py
+
+# Choose injection mode explicitly
+python server.py --injection-mode tool    # native tool call/result pair
+python server.py --injection-mode system  # role=system message
+python server.py --injection-mode user    # role=user message (original BUG-4 behaviour)
+
+# Help
+python server.py --help
 ```
 
-Requires `OPENAI_API_KEY` in `.env`.
+Requires `OPENAI_API_KEY` in `.env`. Server listens on `http://0.0.0.0:7862`.
+
+---
+
+## Experiments
+
+Standalone scripts in `experiments/` that validate API behaviour without the full server:
+
+| Script | What it tests |
+|--------|--------------|
+| `multi_user_msg_test.py` | Does the API accept consecutive `user` messages? How does the LLM handle injection-as-user-role? |
+| `multi_system_msg_test.py` | Does a mid-conversation `system` message override the original system prompt? |
+| `synthetic_tool_msg_test.py` | Do synthetic tool call + result pairs work? Does the LLM avoid re-calling already-resolved tools? |
+
+---
 
 ## Evaluation
 
