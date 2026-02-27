@@ -201,13 +201,14 @@ TOOLS_SCHEMA = [
         "function": {
             "name": "await_job",
             "description": (
-                "Register intent to call another tool once a specific background job completes. "
-                "Use this at any point in the conversation when you realize a follow-up tool call "
-                "needs results from a still-running job. Do NOT call the follow-up tool now with "
-                "guessed or placeholder args — register here and you will be reminded with the real "
-                "result when the job completes, at which point you must call it with concrete arguments. "
-                "If the job has already completed, its result is visible in the conversation — call "
-                "the follow-up tool directly instead of using await_job."
+                "Call this immediately after starting a slow tool (get_hotels, get_activities, get_flights) "
+                "if you already know the next step. Pass the exact job_id from that tool's response and "
+                "describe what to do with the result. "
+                "Example: after firing get_flights(origin='tokyo', destination='amsterdam'), call "
+                "await_job(job_id='<id>', followup_hint='call get_hotels(city=amsterdam) for 2 nights'). "
+                "Do NOT call the follow-up tool now with guessed args — await_job ensures it runs with "
+                "real data. If the job has already completed (you see '(System) Job X completed' in the "
+                "conversation), call the follow-up tool directly instead of using await_job."
             ),
             "parameters": {
                 "type": "object",

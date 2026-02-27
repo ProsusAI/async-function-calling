@@ -33,7 +33,7 @@ Instant tools (get_weather): return results immediately — present them normall
 Slow tools (get_hotels, get_activities, get_flights): run in the background.
 You'll receive a JSON result like {"job_id": "a1b2c3d4", "status": "started", "tool": "...", "args": {...}}.
 The tool name and args are included so you know exactly what's running.
-Acknowledge the job started (do NOT mention the job ID to the user — it's internal bookkeeping) and ask one smart follow-up:
+Acknowledge the job started (do NOT show the raw job_id to the user in chat — but DO use it internally when calling await_job) and ask one smart follow-up:
 - Started get_flights → ask if they'd like hotels or activities at the destination
 - Started get_hotels → ask if they'd like activities nearby or the current weather
 - Started get_activities → ask if they'd like hotel recommendations for that city
@@ -49,16 +49,19 @@ or activity areas from earlier in the conversation. Explain briefly why the top 
 their situation. Reserve a full flat list only when you have no context to work with.
 Note any still-running lookups (without mentioning job IDs), and suggest the next logical step.
 
-Tool dependencies — when a follow-up tool needs a pending job's result:
-Check if the job is still running (you started it but haven't seen a "(System) Job X completed"
-message yet). If still running: call await_job with that job_id and a natural-language description
-of what to call next. Do NOT call the follow-up tool now with guessed args.
-If the job already completed: its result is in the conversation above — call the follow-up tool
-directly with the real result now.
+Tool dependencies — chaining with await_job:
+Immediately after you start a slow tool, if you already know the next step, call await_job
+in your NEXT response — before asking the user anything. Do not wait for a later message.
+- Use the exact job_id from the tool response's "job_id" field.
+- Be concrete: e.g. followup_hint="call get_activities(city='amsterdam', tag='couple')".
+- For multi-step chains, register ALL follow-ups in the same response turn.
+Do NOT guess or hallucinate a job_id. Do NOT call the follow-up tool now with placeholder args.
 
-When you call an intermediate tool triggered by a job completion, re-read the original user
-request. If the user intended further steps after this one, also register await_job for the
-next dependency in the same response turn — do not wait for the next user message."""
+If the job already completed (you see "(System) Job X completed" in the conversation):
+call the follow-up tool directly with the real result — do not use await_job.
+
+When triggered by a job completion, re-read the original user request. If further steps
+remain, also register await_job for the next dependency in the same response turn."""
 
 # --- Global state (single-user experiment) ---
 
@@ -260,8 +263,7 @@ def check_and_inject(history: list):
         bot_text = handle_response(response)
         log.debug("LOCK         releasing from check_and_inject")
 
-    history.append({"role": "assistant", "content": bot_text})
-    return history
+    return history + [{"role": "assistant", "content": bot_text}]
 
 
 # --- UI ---
@@ -272,7 +274,7 @@ with gr.Blocks(title="Async Tools Demo") as demo:
         "Ask about **hotels**, **activities**, **flights** (Tokyo→Mumbai/Amsterdam), or **weather**. "
         "Tools run in the background — results appear automatically."
     )
-    chatbot = gr.Chatbot(height=520, show_label=False)
+    chatbot = gr.Chatbot(height=520, show_label=False, group_consecutive_messages=False)
     msg_box = gr.Textbox(
         placeholder="e.g. What hotels are in Mumbai? What flights go from Tokyo to Amsterdam?",
         show_label=False,
