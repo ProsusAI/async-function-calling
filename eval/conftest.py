@@ -37,6 +37,7 @@ def reset_app_state():
     app.messages.clear()
     app.messages.append({"role": "system", "content": app.SYSTEM_PROMPT})
     app.pending_tools.clear()
+    app.deferred_hints.clear()
     _drain_queue()
     app._lock = threading.Lock()
 
@@ -45,6 +46,7 @@ def reset_app_state():
     # Teardown: clean up again (daemon threads may still be adding to queue)
     _drain_queue()
     app.pending_tools.clear()
+    app.deferred_hints.clear()
 
 
 def _drain_queue():
