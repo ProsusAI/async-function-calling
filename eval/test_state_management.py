@@ -10,7 +10,7 @@ import threading
 import pytest
 from unittest.mock import patch, MagicMock
 
-import app
+from conftest import app
 from conftest import make_mock_msg
 
 
@@ -18,7 +18,7 @@ class TestPendingToolsLifecycle:
     """pending_tools must track in-flight jobs accurately."""
 
     def test_registered_on_fire(self):
-        with patch("tools.time.sleep"):
+        with patch("use_cases.travel.tools.time.sleep"):
             raw = app.fire_tool_async("get_hotels", {"city": "mumbai"})
         job_id = json.loads(raw)["job_id"]
         assert job_id in app.pending_tools
@@ -30,7 +30,7 @@ class TestPendingToolsLifecycle:
         app.results_queue.put((job_id, "get_hotels", {"city": "mumbai"}, "Hotels in Mumbai: ...", None))
 
         terminal = make_mock_msg(content="Here are the hotels.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         assert job_id not in app.pending_tools
@@ -41,7 +41,7 @@ class TestPendingToolsLifecycle:
         app.results_queue.put((job_id, "get_flights", {}, None, "timeout"))
 
         terminal = make_mock_msg(content="Search failed.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         assert job_id not in app.pending_tools
@@ -54,7 +54,7 @@ class TestPendingToolsLifecycle:
             app.results_queue.put((jid, "get_hotels", {}, "Hotels...", None))
 
         terminal = make_mock_msg(content="Here you go.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         for jid in ids:
@@ -71,7 +71,7 @@ class TestPendingToolsLifecycle:
         app.results_queue.put((finished_id, "get_hotels", {}, "Hotels...", None))
 
         terminal = make_mock_msg(content="Hotels found, flights still pending.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         assert finished_id not in app.pending_tools

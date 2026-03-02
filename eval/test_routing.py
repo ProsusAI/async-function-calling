@@ -9,8 +9,8 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock, call
 
-import app
-from tools import SLOW_TOOLS, TOOL_FUNCTIONS
+from conftest import app
+from use_cases.travel.tools import SLOW_TOOLS, TOOL_FUNCTIONS
 from conftest import make_mock_msg
 
 
@@ -45,8 +45,8 @@ class TestSlowToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Hotels are being searched.")
 
-        with patch("app.fire_tool_async", return_value='{"job_id":"aa000000","status":"started","tool":"get_hotels","args":{"city":"mumbai"}}') as mock_fire, \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async", return_value='{"job_id":"aa000000","status":"started","tool":"get_hotels","args":{"city":"mumbai"}}') as mock_fire, \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         mock_fire.assert_called_once_with("get_hotels", {"city": "mumbai"})
@@ -56,8 +56,8 @@ class TestSlowToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Flights are being searched.")
 
-        with patch("app.fire_tool_async", return_value='{"job_id":"bb000000","status":"started","tool":"get_flights","args":{}}') as mock_fire, \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async", return_value='{"job_id":"bb000000","status":"started","tool":"get_flights","args":{}}') as mock_fire, \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         mock_fire.assert_called_once_with("get_flights", {"origin": "tokyo", "destination": "mumbai"})
@@ -67,8 +67,8 @@ class TestSlowToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Activities are being searched.")
 
-        with patch("app.fire_tool_async", return_value='{"job_id":"cc000000","status":"started","tool":"get_activities","args":{}}') as mock_fire, \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async", return_value='{"job_id":"cc000000","status":"started","tool":"get_activities","args":{}}') as mock_fire, \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         mock_fire.assert_called_once_with("get_activities", {"city": "amsterdam", "tag": "couple"})
@@ -80,8 +80,8 @@ class TestSlowToolRouting:
         terminal = make_mock_msg(content="I'll look into that.")
 
         job_json = '{"job_id":"dd000000","status":"started","tool":"get_hotels","args":{"city":"mumbai"}}'
-        with patch("app.fire_tool_async", return_value=job_json), \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async", return_value=job_json), \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         tool_messages = [m for m in app.messages if m.get("role") == "tool"]
@@ -95,8 +95,8 @@ class TestSlowToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Searching...")
 
-        with patch("app.fire_tool_async", return_value='{"job_id":"ee000000","status":"started","tool":"get_hotels","args":{}}'), \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async", return_value='{"job_id":"ee000000","status":"started","tool":"get_hotels","args":{}}'), \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         tool_msg = next(m for m in app.messages if m.get("role") == "tool")
@@ -121,8 +121,8 @@ class TestInstantToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="The weather in Tokyo is rainy.")
 
-        with patch("app.fire_tool_async") as mock_fire, \
-             patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "fire_tool_async") as mock_fire, \
+             patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         mock_fire.assert_not_called()
@@ -133,7 +133,7 @@ class TestInstantToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Tokyo is rainy.")
 
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         tool_messages = [m for m in app.messages if m.get("role") == "tool"]
@@ -151,7 +151,7 @@ class TestInstantToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="It's rainy.")
 
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         tool_msg = next(m for m in app.messages if m.get("role") == "tool")
@@ -164,7 +164,7 @@ class TestInstantToolRouting:
         msg = make_mock_msg(tool_calls=[tc])
         terminal = make_mock_msg(content="Paris weather noted.")
 
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.handle_response(msg)
 
         tool_msg = next(m for m in app.messages if m.get("role") == "tool")

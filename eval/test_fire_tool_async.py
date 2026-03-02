@@ -12,7 +12,7 @@ import threading
 import pytest
 from unittest.mock import patch
 
-import app
+from conftest import app
 
 
 class TestReturnValue:
@@ -21,7 +21,7 @@ class TestReturnValue:
     def _fire(self, tool="get_hotels", args=None):
         if args is None:
             args = {"city": "mumbai"}
-        with patch("tools.time.sleep"):
+        with patch("use_cases.travel.tools.time.sleep"):
             return app.fire_tool_async(tool, args)
 
     def test_returns_valid_json_string(self):
@@ -73,7 +73,7 @@ class TestPendingToolsRegistration:
         event_started = threading.Event()
         event_release = threading.Event()
 
-        patcher = patch("tools.time.sleep")
+        patcher = patch("use_cases.travel.tools.time.sleep")
         mock_sleep = patcher.start()
 
         def slow_sleep(_):
@@ -94,7 +94,7 @@ class TestPendingToolsRegistration:
             patcher.stop()
 
     def test_pending_tools_name_matches(self):
-        with patch("tools.time.sleep"):
+        with patch("use_cases.travel.tools.time.sleep"):
             result = app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "mumbai"})
         job_id = json.loads(result)["job_id"]
         # Give thread a moment to potentially finish (it's mocked so it's fast)
@@ -109,7 +109,7 @@ class TestDistinctJobIds:
     """Multiple fire_tool_async calls must produce distinct job IDs."""
 
     def test_two_calls_distinct(self):
-        with patch("tools.time.sleep"):
+        with patch("use_cases.travel.tools.time.sleep"):
             r1 = json.loads(app.fire_tool_async("get_hotels", {"city": "mumbai"}))
             r2 = json.loads(app.fire_tool_async("get_hotels", {"city": "amsterdam"}))
         assert r1["job_id"] != r2["job_id"]
@@ -132,7 +132,7 @@ class TestDistinctJobIds:
         ]
 
         def fire_and_collect(tool_name, args):
-            with patch("tools.time.sleep"):
+            with patch("use_cases.travel.tools.time.sleep"):
                 parsed = json.loads(app.fire_tool_async(tool_name, args))
             with lock:
                 job_ids.append(parsed["job_id"])
@@ -150,7 +150,7 @@ class TestDistinctJobIds:
         assert len(set(job_ids)) == 10, f"Duplicate job_ids found: {job_ids}"
 
     def test_three_fires_register_in_pending_tools(self):
-        with patch("tools.time.sleep"):
+        with patch("use_cases.travel.tools.time.sleep"):
             r1 = json.loads(app.fire_tool_async("get_hotels", {"city": "mumbai"}))
             r2 = json.loads(app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "mumbai"}))
             r3 = json.loads(app.fire_tool_async("get_activities", {"city": "amsterdam"}))

@@ -11,7 +11,7 @@ import json
 import pytest
 from unittest.mock import patch
 
-import app
+from conftest import app
 from conftest import make_mock_msg
 
 
@@ -39,7 +39,7 @@ class TestCompletionMessageFormat:
         app.results_queue.put((job_id, "get_hotels", args, result_text, None))
 
         terminal = make_mock_msg(content="Here are the hotels!")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         system_msg = next(
@@ -58,7 +58,7 @@ class TestCompletionMessageFormat:
         app.pending_tools[job_id] = {"name": "get_flights", "args": args}
         app.results_queue.put((job_id, "get_flights", args, "Flights from Tokyo to Amsterdam: ...", None))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="Got flights.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Got flights.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -75,7 +75,7 @@ class TestCompletionMessageFormat:
             app.pending_tools[jid] = {"name": "get_hotels", "args": {"city": city}}
             app.results_queue.put((jid, "get_hotels", {"city": city}, f"Hotels in {city.title()}: ...", None))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="Here you go.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Here you go.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -95,7 +95,7 @@ class TestFailureMessageFormat:
         app.pending_tools[job_id] = {"name": "get_hotels", "args": args}
         app.results_queue.put((job_id, "get_hotels", args, None, "City not found"))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="Sorry about that.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Sorry about that.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -111,7 +111,7 @@ class TestFailureMessageFormat:
         app.pending_tools[job_id] = {"name": "get_flights", "args": {}}
         app.results_queue.put((job_id, "get_flights", {}, None, "API error"))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="Flights search failed.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Flights search failed.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -132,7 +132,7 @@ class TestStillPendingLine:
         app.pending_tools[still_running_id] = {"name": "get_flights", "args": {}}
         app.results_queue.put((finished_id, "get_hotels", {"city": "mumbai"}, "Hotels...", None))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="Hotels found, waiting on flights.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Hotels found, waiting on flights.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -148,7 +148,7 @@ class TestStillPendingLine:
         app.pending_tools[job_id] = {"name": "get_hotels", "args": {"city": "mumbai"}}
         app.results_queue.put((job_id, "get_hotels", {"city": "mumbai"}, "Hotels...", None))
 
-        with patch("app.call_openai", return_value=make_mock_msg(content="All done.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="All done.")):
             app.check_and_inject([])
 
         system_msg = next(
@@ -169,7 +169,7 @@ class TestHistoryUpdate:
         history = [{"role": "user", "content": "Find hotels"}]
         terminal = make_mock_msg(content="Here are the top hotels in Mumbai!")
 
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             updated_history = app.check_and_inject(history)
 
         last = updated_history[-1]
@@ -183,7 +183,7 @@ class TestHistoryUpdate:
 
         history = []
         original_len = len(history)
-        with patch("app.call_openai", return_value=make_mock_msg(content="Great activities found.")):
+        with patch.object(app, "call_openai", return_value=make_mock_msg(content="Great activities found.")):
             updated = app.check_and_inject(history)
 
         assert len(updated) == original_len + 1
