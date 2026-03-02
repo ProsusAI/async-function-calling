@@ -11,6 +11,12 @@ from fastapi.staticfiles import StaticFiles
 
 from core import AsyncEngine
 from use_cases.travel import TravelUseCase
+from use_cases.music  import MusicUseCase
+
+USE_CASES = {
+    "travel": TravelUseCase,
+    "music":  MusicUseCase,
+}
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -114,6 +120,12 @@ app.mount("/", StaticFiles(directory="static", html=True), name="static")
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Async Tools Demo server")
     parser.add_argument(
+        "--use-case",
+        choices=list(USE_CASES),
+        default="travel",
+        help="Which use case to run (default: travel)",
+    )
+    parser.add_argument(
         "--injection-mode",
         choices=["user", "system", "tool"],
         default="tool",
@@ -126,11 +138,12 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    engine = AsyncEngine(TravelUseCase, injection_mode=args.injection_mode)
+    use_case = USE_CASES[args.use_case]
+    engine = AsyncEngine(use_case, injection_mode=args.injection_mode)
 
     log.info("=" * 50)
-    log.info("Starting server  injection_mode=%s", args.injection_mode)
+    log.info("Starting server  use_case=%s  injection_mode=%s", args.use_case, args.injection_mode)
     log.info("=" * 50)
-    print(f"Starting server with injection_mode={args.injection_mode!r}")
+    print(f"Starting server: use_case={args.use_case!r}  injection_mode={args.injection_mode!r}")
 
     uvicorn.run(app, host="0.0.0.0", port=7862, log_level="warning")
