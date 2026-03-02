@@ -204,6 +204,52 @@ Requires `OPENAI_API_KEY` + `ANTHROPIC_API_KEY` (Claude used as judge).
 
 **Criteria**: no job ID leaked, acknowledgment present, follow-up asked, no `(System)` echoed, synthesis quality (LLM judge 0–5).
 
+### `single_message_eval` — async vs sync benchmark
+
+Quantifies the latency/quality tradeoff of async injection across 4 injection modes and 6 single-turn scenarios. Each trial is one user message → tool calls → final synthesis; single-turn design isolates the injection mechanism from multi-turn accumulation effects.
+
+```bash
+# Quick run (0.5s tools, 3 trials)
+uv run python eval/benchmark/run_benchmark.py --tool-delay 0.5 --trials 3
+
+# Specific scenarios and modes
+uv run python eval/benchmark/run_benchmark.py --scenarios two_parallel chain --modes sync async/tool
+
+# Full run with JSON output
+uv run python eval/benchmark/run_benchmark.py --trials 10 --output results.json
+
+# With LLM judge (requires ANTHROPIC_API_KEY)
+uv run python eval/benchmark/run_benchmark.py --llm-judge --trials 5
+```
+
+**Four conditions** — same LLM, same tools, same data; only result re-injection differs:
+
+| Mode | How results re-enter the model |
+|---|---|
+| `sync` | Tool runs inline; real result returned in the same turn |
+| `async/tool` | Synthetic `assistant` tool_call + `tool` result pair injected |
+| `async/system` | `role=system` message with job completion text |
+| `async/user` | `role=user` message with `(System) Job X completed: …` |
+
+**Six scenarios** (Music use case, deterministic dummy data):
+
+| Scenario | Tools | What it measures |
+|---|---|---|
+| `instant_only` | `get_mood_genres` (instant) | Control — sync and async should be identical |
+| `single_slow` | `search_artists` (2s) | Base overhead of one injection |
+| `mixed_instant_slow` | `get_genre_info` + `search_artists` | Mixed routing correctness |
+| `two_parallel` | `search_artists` ×2 (parallel) | ~2× latency advantage |
+| `three_parallel` | `search_artists` ×2 + `build_playlist` | ~3× latency advantage; hardest for quality |
+| `chain` | `search_artists` → `get_discography` | Dependent chaining via `await_job` |
+
+**Metrics**:
+
+- **Total latency / TTFR** — wall-clock time; async TTFR is the acknowledgment latency (near-zero vs tool execution time)
+- **Pass@1** — fraction of trials where `success_marker` appears in the final response
+- **Pass^k** — `pass@1 ^ k`; exposes compounding reliability cost that `pass@1` understates
+- **Job ID leaked** — regex check for 8-char hex IDs in assistant messages (protocol failure indicator)
+- **Synthesis quality / context awareness** — optional LLM-judge scores (0–5, Claude Sonnet)
+
 ---
 
 ## Experiments
