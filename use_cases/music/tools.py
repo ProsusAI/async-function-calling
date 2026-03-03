@@ -211,7 +211,7 @@ def search_artists(args: dict) -> str:
     genre = args.get("genre", "").lower().strip()
     mood  = args.get("mood",  "").lower().strip()
 
-    time.sleep(2)  # simulated catalog search
+    time.sleep(5)  # simulated catalog search
 
     # Resolve mood → genre when no genre given
     if mood and not genre:
@@ -235,7 +235,7 @@ def search_artists(args: dict) -> str:
 def get_discography(args: dict) -> str:
     artist = args.get("artist", "").strip()
 
-    time.sleep(3)  # simulated discography fetch
+    time.sleep(8)  # simulated discography fetch
 
     data = _DISCOGRAPHY.get(artist)
     if not data:
@@ -258,7 +258,7 @@ def build_playlist(args: dict) -> str:
     vibe   = args.get("vibe",   "chill").strip()
     length = min(int(args.get("length", 10)), 20)
 
-    time.sleep(4)  # playlist curation is the slowest operation
+    time.sleep(12)  # playlist curation is the slowest operation
 
     tracks = _PLAYLIST_TRACKS[:length]
 

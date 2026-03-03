@@ -68,6 +68,10 @@
       box-shadow: 0 1px 3px rgba(0,0,0,.08);
     }
 
+    .bubble.assistant.async-result {
+      border-left: 3px solid #16a34a;
+    }
+
     .bubble.thinking {
       align-self: flex-start;
       background: #fff;
@@ -161,7 +165,7 @@
 
       if (event.type === "assistant") {
         removeThinking();
-        addBubble("assistant", event.data.content);
+        addBubble("assistant", event.data.content, event.data.async);
       } else if (event.type === "reset") {
         chat.innerHTML = "";
       }
@@ -173,9 +177,9 @@
 
     // ── Helpers ───────────────────────────────────────────────────────────────
 
-    function addBubble(role, text) {
+    function addBubble(role, text, isAsync = false) {
       const el = document.createElement("div");
-      el.className = `bubble ${role}`;
+      el.className = `bubble ${role}${isAsync ? " async-result" : ""}`;
       if (role === "assistant") {
         el.innerHTML = marked.parse(text);
       } else {

@@ -16,12 +16,14 @@ import time
 import threading
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+_ROOT = Path(__file__).parent.parent.parent
+sys.path.insert(0, str(_ROOT))                      # project root (core, use_cases)
+sys.path.insert(0, str(Path(__file__).parent))      # benchmark package (metrics, scenarios, …)
 
 from core.engine import AsyncEngine
-from .metrics import TrialResult, check_job_id_leaked
-from .scenarios import BenchScenario
-from .sync_engine import SyncEngine
+from metrics import TrialResult, check_job_id_leaked
+from scenarios import BenchScenario
+from sync_engine import SyncEngine
 
 _TIMEOUT = 30.0       # max seconds to wait for background tools
 _SIBLING_WAIT = 0.1   # brief window for parallel tools to land together
@@ -51,51 +53,65 @@ def run_trial(
     is_sync = isinstance(engine, SyncEngine)
     engine._auto_inject = False  # benchmark drives injection; no background spawning
 
-    engine.messages.append({"role": "user", "content": scenario.user_message})
+    # Count every call_openai() invocation for this trial.
+    _llm_call_count = [0]
+    _original_call_openai = engine.call_openai
+    def _counting_call_openai():
+        _llm_call_count[0] += 1
+        return _original_call_openai()
+    engine.call_openai = _counting_call_openai
 
-    t0 = time.perf_counter()
+    try:
+        engine.messages.append({"role": "user", "content": scenario.user_message})
 
-    # Initial LLM call — dispatches tools (slow ones go to background threads
-    # for async modes; fire_tool_async() blocks for SyncEngine).
-    initial_msg = engine.call_openai()
-    initial_text = engine.handle_response(initial_msg)
-    ttfr = time.perf_counter() - t0
+        t0 = time.perf_counter()
 
-    if is_sync or not engine.pending_tools:
-        # Sync: all tools ran inline — done immediately.
-        # Async with only instant tools (instant_only scenario): also done.
-        total_latency = time.perf_counter() - t0
-        final_text = initial_text
-    else:
-        # Async: wait for background jobs, inject results, synthesize.
-        final_text = _wait_and_inject_all(engine, t0)
-        total_latency = time.perf_counter() - t0
+        # Initial LLM call — dispatches tools (slow ones go to background threads
+        # for async modes; fire_tool_async() blocks for SyncEngine).
+        initial_msg = engine.call_openai()
+        initial_text = engine.handle_response(initial_msg)
+        ttfr = time.perf_counter() - t0
 
-    # --- Deterministic quality checks ---
-    success = scenario.success_marker in final_text
-    job_id_leaked = check_job_id_leaked(engine.messages)
+        if is_sync or not engine.pending_tools:
+            # Sync: all tools ran inline — done immediately.
+            # Async with only instant tools (instant_only scenario): also done.
+            total_latency = time.perf_counter() - t0
+            final_text = initial_text
+        else:
+            # Async: wait for background jobs, inject results, synthesize.
+            final_text = _wait_and_inject_all(engine, t0)
+            total_latency = time.perf_counter() - t0
 
-    # --- Optional LLM judge ---
-    synthesis_quality = None
-    context_awareness = None
-    if llm_judge_fn is not None:
-        try:
-            synthesis_quality, context_awareness = llm_judge_fn(engine.messages, final_text)
-        except Exception:
-            pass  # judge failure is non-fatal; scores stay None
+        # --- Deterministic quality checks ---
+        # Case-insensitive: avoids false failures when system-prompt differences
+        # affect capitalisation (e.g. "Ambient" vs "ambient").
+        success = scenario.success_marker.lower() in final_text.lower()
+        job_id_leaked = check_job_id_leaked(engine.messages)
 
-    return TrialResult(
-        scenario_name=scenario.name,
-        mode=mode,
-        trial_idx=trial_idx,
-        total_latency=total_latency,
-        ttfr=ttfr,
-        success=success,
-        job_id_leaked=job_id_leaked,
-        synthesis_quality=synthesis_quality,
-        context_awareness=context_awareness,
-        final_response=final_text,
-    )
+        # --- Optional LLM judge ---
+        synthesis_quality = None
+        context_awareness = None
+        if llm_judge_fn is not None:
+            try:
+                synthesis_quality, context_awareness = llm_judge_fn(engine.messages, final_text)
+            except Exception:
+                pass  # judge failure is non-fatal; scores stay None
+
+        return TrialResult(
+            scenario_name=scenario.name,
+            mode=mode,
+            trial_idx=trial_idx,
+            total_latency=total_latency,
+            ttfr=ttfr,
+            success=success,
+            job_id_leaked=job_id_leaked,
+            synthesis_quality=synthesis_quality,
+            context_awareness=context_awareness,
+            final_response=final_text,
+            num_llm_calls=_llm_call_count[0],
+        )
+    finally:
+        engine.call_openai = _original_call_openai
 
 
 def _wait_and_inject_all(engine: AsyncEngine, t0: float) -> str:
