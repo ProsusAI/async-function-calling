@@ -27,9 +27,10 @@ class AsyncEngine:
     injection strategies, and SSE broadcast.
     """
 
-    def __init__(self, use_case: UseCase, injection_mode: str = "tool"):
+    def __init__(self, use_case: UseCase, injection_mode: str = "tool", model: str = "gpt-4o"):
         self.use_case = use_case
         self.injection_mode = injection_mode
+        self.model = model
 
         # Compose system prompt: base (async mechanics) + use-case (domain)
         base = BASE_SYSTEM_PROMPTS[injection_mode]
@@ -101,7 +102,7 @@ class AsyncEngine:
         """Call the OpenAI chat completions API with current messages."""
         log.info("OPENAI CALL  messages=%d  (last role: %s)", len(self.messages), self.messages[-1]["role"])
         response = self._client.chat.completions.create(
-            model="gpt-4o",
+            model=self.model,
             tools=self._tools_schema,
             messages=self.messages,
         )
@@ -319,7 +320,7 @@ class AsyncEngine:
             response = self.call_openai()
             bot_text = self.handle_response(response)
 
-        self.push_event("assistant", {"content": bot_text})
+        self.push_event("assistant", {"content": bot_text, "async": True})
 
     # ------------------------------------------------------------------
     # Lifecycle
