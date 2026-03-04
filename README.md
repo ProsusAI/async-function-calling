@@ -207,6 +207,64 @@ engine = AsyncEngine(use_case, forced_sync=True)
 
 ---
 
+## Hooks
+
+`UseCase` accepts an optional `hooks` parameter for observing and modifying tool calls without touching `core/`.
+
+```python
+from core import Hooks, UseCase
+
+MyUseCase = UseCase(
+    ...,
+    hooks=Hooks(
+        before_tool=lambda name, args: args,       # inspect / modify args, or return None to cancel
+        after_tool=lambda name, args, result: result,  # inspect / modify result
+    ),
+)
+```
+
+### `before_tool(name, args) → dict | None`
+
+Called before every tool invocation (sync and async). Two outcomes:
+
+| Return value | Effect |
+|---|---|
+| `dict` | Tool is called with the returned args (may be the original or modified) |
+| `None` | Tool call is cancelled; LLM receives `{"status": "cancelled"}` as the tool result |
+
+```python
+# Log and add a default arg
+def before(name, args):
+    print(f"→ {name}({args})")
+    if name == "get_hotels" and "stars" not in args:
+        args = {**args, "stars": 4}
+    return args
+
+# Block a specific tool
+def before(name, args):
+    if name == "get_flights":
+        return None   # cancelled
+    return args
+```
+
+### `after_tool(name, args, result) → str`
+
+Called after every tool completes — for sync tools immediately, for async tools once the background thread finishes (before the result is injected into the conversation).
+
+```python
+# Cache results by tool + args
+_cache = {}
+
+def after(name, args, result):
+    key = (name, json.dumps(args, sort_keys=True))
+    _cache[key] = result
+    return result
+```
+
+Both hooks are **no-ops when not set** — existing use cases without a `hooks=` argument are unaffected.
+
+---
+
 ## How async tool dispatch works
 
 ### Tool classification

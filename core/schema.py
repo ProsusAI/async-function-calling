@@ -1,5 +1,23 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
+
+
+@dataclass
+class Hooks:
+    """
+    Optional lifecycle hooks for a UseCase.
+
+    before_tool(tool_name, args) -> dict | None
+        Called before every tool invocation. Return a (possibly modified) args
+        dict to proceed, or None to cancel the call entirely.
+
+    after_tool(tool_name, args, result) -> str
+        Called after every tool completes (sync result or async result before
+        injection). Return a (possibly modified) result string.
+    """
+
+    before_tool: Callable[[str, dict], "dict | None"] | None = field(default=None)
+    after_tool: Callable[[str, dict, str], str] | None = field(default=None)
 
 
 @dataclass
@@ -76,3 +94,6 @@ class UseCase:
     implementation fn, and sync/async mode in one place.
     Do NOT include await_job — the engine appends it automatically.
     """
+
+    hooks: "Hooks | None" = None
+    """Optional lifecycle hooks (before_tool, after_tool)."""

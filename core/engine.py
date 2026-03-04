@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 from .await_job import AWAIT_JOB_SCHEMA
 from .prompts import BASE_SYSTEM_PROMPTS
 from .return_answer import RETURN_ANSWER_SCHEMA
-from .schema import UseCase
+from .schema import Hooks, UseCase
 
 load_dotenv()
 
@@ -70,6 +70,7 @@ class AsyncEngine:
         max_steps: int = 20,
     ):
         self.use_case = use_case
+        self._hooks: Hooks | None = use_case.hooks
         # Sub-agents always use "tool" injection mode internally.
         self.injection_mode = "tool" if done_event is not None else injection_mode
         self.model = model
@@ -140,6 +141,22 @@ class AsyncEngine:
         self._auto_inject: bool = True
 
     # ------------------------------------------------------------------
+    # Hook helpers
+    # ------------------------------------------------------------------
+
+    def _before_tool(self, name: str, args: dict) -> "dict | None":
+        """Call before_tool hook. Returns (possibly modified) args, or None to cancel."""
+        if self._hooks and self._hooks.before_tool:
+            return self._hooks.before_tool(name, args)
+        return args
+
+    def _after_tool(self, name: str, args: dict, result: str) -> str:
+        """Call after_tool hook. Returns (possibly modified) result."""
+        if self._hooks and self._hooks.after_tool:
+            return self._hooks.after_tool(name, args, result)
+        return result
+
+    # ------------------------------------------------------------------
     # SSE
     # ------------------------------------------------------------------
 
@@ -164,7 +181,8 @@ class AsyncEngine:
 
         if self._forced_sync:
             log.info("TOOL SYNC   tool=%s  args=%s", tool_name, json.dumps(tool_args))
-            return tool_fn(tool_args)
+            result = tool_fn(tool_args)
+            return self._after_tool(tool_name, tool_args, result)
 
         job_id = uuid.uuid4().hex[:8]
         log.info("TOOL START  job=%s  tool=%s  args=%s", job_id, tool_name, json.dumps(tool_args))
@@ -173,6 +191,7 @@ class AsyncEngine:
             log.debug("BG THREAD   job=%s  tool=%s  executing...", job_id, tool_name)
             try:
                 result = tool_fn(tool_args)
+                result = self._after_tool(tool_name, tool_args, result)
                 preview = result[:120] + "..." if len(result) > 120 else result
                 log.info("BG DONE     job=%s  tool=%s  result_preview=%r", job_id, tool_name, preview)
                 self.results_queue.put((job_id, tool_name, tool_args, result, None))
@@ -284,7 +303,11 @@ class AsyncEngine:
 
             elif tool_name in self._tool_map and self._tool_map[tool_name].is_async:
                 log.info("DISPATCH     async tool=%s  args=%s", tool_name, json.dumps(tool_args))
-                content = self.fire_tool_async(tool_name, tool_args)
+                modified_args = self._before_tool(tool_name, tool_args)
+                if modified_args is None:
+                    content = json.dumps({"status": "cancelled", "reason": "Hook cancelled tool call."})
+                else:
+                    content = self.fire_tool_async(tool_name, modified_args)
 
             elif tool_name == "await_job":
                 job_id = tool_args.get("job_id", "")
@@ -312,7 +335,12 @@ class AsyncEngine:
 
             else:
                 log.info("DISPATCH     sync tool=%s  args=%s", tool_name, json.dumps(tool_args))
-                content = self._tool_map[tool_name].fn(tool_args)
+                modified_args = self._before_tool(tool_name, tool_args)
+                if modified_args is None:
+                    content = json.dumps({"status": "cancelled", "reason": "Hook cancelled tool call."})
+                else:
+                    content = self._tool_map[tool_name].fn(modified_args)
+                    content = self._after_tool(tool_name, modified_args, content)
                 preview = content[:80] + "..." if len(content) > 80 else content
                 log.debug("INSTANT RES  tool=%s  result=%r", tool_name, preview)
 
