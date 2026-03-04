@@ -1,92 +1,207 @@
 # Async Tool-Calling Framework
 
-A reusable framework for **async LLM tool calling** — slow tools run in background threads while the model continues the conversation, and results are pushed to the browser via SSE when ready. Ships with a travel assistant use case.
+A reusable framework for **async LLM tool calling** — slow tools run in background threads while the model continues the conversation, and results are pushed to the browser via SSE when ready. Supports single-agent and **multi-agent** setups where agents delegate to specialist sub-agents.
 
 ## Structure
 
 ```
-core/                        ← reusable async tool-calling framework
-│   schema.py                  UseCase dataclass (plugin contract)
-│   engine.py                  AsyncEngine: OpenAI loop, async dispatch, SSE push
-│   prompts.py                 Base system prompts (async mechanics, mode-specific)
-│   await_job.py               await_job tool schema (framework-owned)
+core/
+│   schema.py          Tool and UseCase dataclasses (plugin contract)
+│   engine.py          AsyncEngine: OpenAI loop, async dispatch, SSE, sub-agent support
+│   prompts.py         Base system prompts (async mechanics, mode-specific)
+│   await_job.py       await_job tool schema (framework-owned)
+│   return_answer.py   return_answer_to_parent tool schema (framework-owned, sub-agents only)
+│   agent_tool.py      AgentTool: wraps a UseCase as a callable tool for orchestrators
 │   __init__.py
 
 use_cases/
-└── travel/                  ← travel assistant use case
-        tools.py               tool implementations + OpenAI schemas
-        prompt.py              travel-specific system prompt fragment
-        __init__.py            TravelUseCase = UseCase(...)
+├── travel/            Travel assistant (flights, hotels, activities)
+├── music/             Music discovery (artists, genres, playlists)
+└── multi/             Multi-agent demo: orchestrator → travel + music sub-agents
 
-server.py                    ← thin FastAPI wiring (~100 lines)
-static/index.html            ← browser UI: fetch + EventSource, vanilla JS
-experiments/                 ← standalone scripts for validating API behaviour
-eval/                        ← 61 infrastructure tests + LLM behaviour eval
+server.py              Thin FastAPI wiring (~150 lines)
+static/index.html      Browser UI: fetch + EventSource, vanilla JS
+eval/                  Infrastructure tests + LLM behaviour eval + async/sync benchmark
+experiments/           Standalone scripts for validating API behaviour
 ```
 
 ## Running
 
 ```bash
-# Default (tool injection mode — recommended)
+# Travel assistant (default)
 uv run server.py
 
-# Choose injection mode explicitly
+# Music discovery
+uv run server.py --use-case music
+
+# Multi-agent demo (orchestrator → travel + music sub-agents in parallel)
+uv run server.py --use-case multi
+
+# Choose injection mode for background job results
 uv run server.py --injection-mode tool    # synthetic tool call/result pair (default)
 uv run server.py --injection-mode system  # role=system message
 uv run server.py --injection-mode user    # role=user message
-
-# Help
-uv run server.py --help
 ```
 
 Requires `OPENAI_API_KEY` in `.env`. Server listens on `http://0.0.0.0:7862`.
 
-## Adding a new use case
+---
 
-Create `use_cases/<domain>/` with three files:
+## Adding a single-agent use case
 
-**`tools.py`** — tool implementations and OpenAI schemas:
+Create `use_cases/<domain>/` with:
+
+**`tools.py`** — tool implementations:
 ```python
-SLOW_TOOLS = {"slow_tool_a", "slow_tool_b"}   # run in background threads
-TOOL_FUNCTIONS = {"slow_tool_a": fn_a, "instant_tool": fn_b, ...}
-TOOL_SCHEMAS = [...]  # OpenAI function schemas — do NOT include await_job
+from core.schema import Tool
+
+def _get_hotels(args: dict) -> str:
+    city = args["city"]
+    return f"Hotels in {city}: ..."
+
+get_hotels = Tool(
+    name="get_hotels",
+    description="Find hotels in a city.",
+    parameters={"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    fn=_get_hotels,
+    is_async=True,   # slow tool — runs in background thread
+)
+
+get_weather = Tool(
+    name="get_weather",
+    description="Get current weather.",
+    parameters={"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+    fn=lambda args: f"Weather in {args['city']}: sunny",
+    is_async=False,  # instant — runs inline
+)
 ```
 
 **`prompt.py`** — domain-specific system prompt fragment:
 ```python
-SYSTEM_PROMPT = "You are a ... assistant. Available tools: ..."
+SYSTEM_PROMPT = "You are a travel assistant. ..."
 ```
 
 **`__init__.py`** — wire it together:
 ```python
-from core import UseCase
-from .tools import SLOW_TOOLS, TOOL_FUNCTIONS, TOOL_SCHEMAS
+from core.schema import UseCase
+from .tools import get_hotels, get_weather
 from .prompt import SYSTEM_PROMPT
 
 MyUseCase = UseCase(
     display_name="My Assistant",
     input_placeholder="Ask me anything…",
     system_prompt=SYSTEM_PROMPT,
-    tool_schemas=TOOL_SCHEMAS,
-    tool_functions=TOOL_FUNCTIONS,
-    slow_tools=SLOW_TOOLS,
+    tools=[get_hotels, get_weather],
 )
 ```
 
-Then in `server.py`, swap `TravelUseCase` → `MyUseCase`. Zero changes to `core/`.
+Then pass `MyUseCase` to `AsyncEngine` in `server.py`. Zero changes to `core/`.
 
 ---
 
-## How it works
+## Multi-agent setup
+
+### How it works
+
+An **orchestrator agent** calls specialist **sub-agents** as tools. Each sub-agent runs its own full `AsyncEngine` loop — with its own queue, lock, and background threads — completely isolated from the parent.
+
+The sub-agent signals completion by calling `return_answer_to_parent`, a framework-owned tool automatically added to every sub-agent's tool list. The orchestrator's `AgentTool` blocks on a `threading.Event` until this is called, then injects the answer into the parent's conversation.
+
+```
+Orchestrator (AsyncEngine)
+  │
+  ├── calls music_agent(query="jazz for Amsterdam")   → is_async=True → BG thread
+  ├── calls travel_agent(query="trip to Amsterdam")   → is_async=True → BG thread
+  │                      │                                      │
+  │           music sub-agent runs                  travel sub-agent runs
+  │           its own ReACT loop                    its own ReACT loop
+  │           fires search_artists ──────────────── fires get_hotels
+  │           fires build_playlist   (parallel)     fires get_flights
+  │           calls return_answer_to_parent(...)     calls return_answer_to_parent(...)
+  │                      │                                      │
+  │           done_event.set()                      done_event.set()
+  │                      │                                      │
+  ├── parent results_queue ←─────────────────────────────────── ┘
+  └── _run_injection fires → parent synthesizes → SSE push to browser
+```
+
+### `AgentTool` — wrapping a use case as a tool
+
+```python
+from core.agent_tool import AgentTool
+from use_cases.music import MusicUseCase
+
+AgentTool(
+    name="music_agent",
+    description="Music specialist: recommendations, playlists, artists, genres, moods.",
+    use_case=MusicUseCase,
+    is_async=True,      # how the parent calls this agent (True = non-blocking, parallel)
+    forced_sync=False,  # how this agent runs its own tools (False = internal parallelism)
+    max_steps=20,       # max OpenAI call rounds before giving up
+)
+```
+
+**`is_async` and `forced_sync` are orthogonal:**
+
+| `is_async` | `forced_sync` | Meaning |
+|-----------|--------------|---------|
+| `True` | `False` | Sub-agent fires in parent background thread; sub-agent's own tools run in parallel. Best performance. |
+| `True` | `True` | Sub-agent fires in parent background thread; sub-agent runs its own tools sequentially. |
+| `False` | `False` | Parent blocks until sub-agent finishes; sub-agent's tools run in parallel. |
+| `False` | `True` | Fully sequential end-to-end. Equivalent to old `SyncEngine` behaviour. |
+
+### `return_answer_to_parent` — the sub-agent's exit signal
+
+This framework-owned tool is automatically added to every sub-agent's tool list. Sub-agents **must** call it to return their answer — the parent gets a timeout error string if the sub-agent exhausts `max_steps` without calling it.
+
+The sub-agent's system prompt is automatically prepended with:
+> *"You are a specialist sub-agent. Do NOT ask the user for clarification. When your task is complete, you MUST call `return_answer_to_parent`."*
+
+### Building a multi-agent use case
+
+```python
+from core.schema import UseCase
+from core.agent_tool import AgentTool
+from use_cases.music import MusicUseCase
+from use_cases.travel import TravelUseCase
+
+MultiUseCase = UseCase(
+    display_name="Multi-Agent Demo",
+    input_placeholder="e.g. Plan a jazz-themed trip to Amsterdam",
+    system_prompt="You are a coordinator. Delegate to specialists. Synthesize their answers.",
+    tools=[
+        AgentTool("music_agent", "Music specialist.", MusicUseCase, is_async=True),
+        AgentTool("travel_agent", "Travel specialist.", TravelUseCase, is_async=True),
+    ],
+)
+```
+
+Run it:
+```bash
+uv run server.py --use-case multi
+```
+
+### `forced_sync` on the parent
+
+`forced_sync` also works on the parent engine directly — useful for testing or when you need deterministic sequential execution:
+
+```python
+# All tools (including AgentTools) run inline; no background threads
+engine = AsyncEngine(use_case, forced_sync=True)
+```
+
+---
+
+## How async tool dispatch works
 
 ### Tool classification
 
-Tools are classified as **slow** or **instant** in the use case's `slow_tools` set:
+Each `Tool` carries its own `is_async` flag:
 
-| Type | Behaviour |
-|------|-----------|
-| Instant | Runs inline; result returned synchronously in the same OpenAI turn |
-| Slow | Dispatched to a background thread; model gets `{"job_id": ..., "status": "started"}` immediately |
+| `is_async` | Behaviour |
+|-----------|-----------|
+| `False` | Runs inline; real result returned synchronously in the same OpenAI turn |
+| `True` | Dispatched to a background thread; model gets `{"job_id": ..., "status": "started"}` immediately |
 
 ### Request flow
 
@@ -94,7 +209,7 @@ Tools are classified as **slow** or **instant** in the use case's `slow_tools` s
 Browser POST /chat
   → acquire _lock
   → append user message
-  → call OpenAI  (LLM may dispatch slow tools → background threads start)
+  → call OpenAI  (may dispatch async tools → background threads start)
   → handle_response() recurses until no tool calls remain
   → release _lock
   → push_event("assistant", ...) → SSE → browser renders bubble
@@ -115,21 +230,19 @@ The browser opens a single persistent `GET /stream` connection at page load. The
 
 ### System prompt composition
 
-The full system prompt is:
-
 ```
 BASE_SYSTEM_PROMPT[injection_mode]   ← async mechanics (framework-owned)
 ---
-use_case.system_prompt               ← domain persona, tools, heuristics
+use_case.system_prompt               ← domain persona and tool descriptions
 ```
 
-`BASE_SYSTEM_PROMPT` covers: job IDs, slow vs. instant distinction, how results arrive back, proactive synthesis, `await_job` chaining rules. The use case only adds domain knowledge.
+For sub-agents, the engine prepends a sub-agent preamble before the base prompt.
 
 ---
 
 ## Injection modes
 
-When a background job completes the result must re-enter the LLM's message history. Three strategies are supported via `--injection-mode`.
+When a background job completes, the result re-enters the LLM's message history. Three strategies are supported via `--injection-mode`.
 
 ### `tool` *(default)*
 
@@ -140,23 +253,17 @@ Two synthetic messages appended per completed job:
 {"role": "tool", "tool_call_id": "call_a1b2c3", "content": "Hotels in Amsterdam: ..."}
 ```
 
-The LLM reads this like a normal synchronous tool call — no role confusion, no special instructions needed.
-
 ### `system`
 
 ```python
 {"role": "system", "content": "(System) Job abc123 completed: get_hotels(...) → Hotels: ..."}
 ```
 
-Mid-conversation `system` messages are accepted by the API and don't override the original prompt.
-
 ### `user`
 
 ```python
 {"role": "user", "content": "(System) Job abc123 completed: get_hotels(...) → Hotels: ..."}
 ```
-
-Original behaviour. Can confuse the LLM when a real user message arrives in the same turn.
 
 ### `await_job` — dependent tool chaining
 
@@ -167,7 +274,7 @@ LLM fires get_flights(tokyo, amsterdam)  → job_id = "abc123"
 LLM calls await_job(job_id="abc123", followup_hint="call get_hotels(city=amsterdam)")
 ```
 
-When the job completes, the hint is appended alongside the result as a `system` reminder. The LLM sees its earlier intent and immediately chains the next call.
+When the job completes, the hint is appended alongside the result. The LLM sees its earlier intent and immediately chains the next call.
 
 ---
 
@@ -179,17 +286,6 @@ When the job completes, the hint is appended alongside the result as a `system` 
 uv run pytest eval/ -v
 ```
 
-61 tests across 6 files:
-
-| File | What it tests |
-|------|--------------|
-| `test_fire_tool_async.py` | Job JSON format, hex IDs, `pending_tools` timing, 10 concurrent calls |
-| `test_routing.py` | `SLOW_TOOLS` membership, slow → async, instant → inline, message format |
-| `test_queue_mechanics.py` | 5-tuple deposit, multi-thread, `collect_finished_results` drains queue |
-| `test_error_handling.py` | Exceptions → FAILED entry (no silent hangs), FAILED message format |
-| `test_state_management.py` | `pending_tools` lifecycle, `_lock` prevents concurrent corruption |
-| `test_check_and_inject.py` | Completion/failure message format, still-pending line, history update |
-
 ### LLM behaviour evaluation
 
 ```bash
@@ -200,13 +296,7 @@ uv run python eval/run_llm_eval.py --output results.json
 
 Requires `OPENAI_API_KEY` + `ANTHROPIC_API_KEY` (Claude used as judge).
 
-**Scenarios**: `flights_basic`, `hotels_basic`, `result_synthesis`, `parallel_tools`, `instant_tool`, `error_injection`
-
-**Criteria**: no job ID leaked, acknowledgment present, follow-up asked, no `(System)` echoed, synthesis quality (LLM judge 0–5).
-
 ### `single_message_eval` — async vs sync benchmark
-
-Quantifies the latency/quality tradeoff of async injection across 4 injection modes and 6 single-turn scenarios. Each trial is one user message → tool calls → final synthesis; single-turn design isolates the injection mechanism from multi-turn accumulation effects.
 
 ```bash
 # Quick run (0.5s tools, 3 trials)
@@ -217,38 +307,16 @@ uv run python eval/benchmark/run_benchmark.py --scenarios two_parallel chain --m
 
 # Full run with JSON output
 uv run python eval/benchmark/run_benchmark.py --trials 10 --output results.json
-
-# With LLM judge (requires ANTHROPIC_API_KEY)
-uv run python eval/benchmark/run_benchmark.py --llm-judge --trials 5
 ```
 
-**Four conditions** — same LLM, same tools, same data; only result re-injection differs:
+**Four conditions** — same LLM, same tools; only result re-injection differs:
 
 | Mode | How results re-enter the model |
-|---|---|
-| `sync` | Tool runs inline; real result returned in the same turn |
+|------|-------------------------------|
+| `sync` | Tool runs inline; real result returned in the same turn (`forced_sync=True`) |
 | `async/tool` | Synthetic `assistant` tool_call + `tool` result pair injected |
 | `async/system` | `role=system` message with job completion text |
 | `async/user` | `role=user` message with `(System) Job X completed: …` |
-
-**Six scenarios** (Music use case, deterministic dummy data):
-
-| Scenario | Tools | What it measures |
-|---|---|---|
-| `instant_only` | `get_mood_genres` (instant) | Control — sync and async should be identical |
-| `single_slow` | `search_artists` (2s) | Base overhead of one injection |
-| `mixed_instant_slow` | `get_genre_info` + `search_artists` | Mixed routing correctness |
-| `two_parallel` | `search_artists` ×2 (parallel) | ~2× latency advantage |
-| `three_parallel` | `search_artists` ×2 + `build_playlist` | ~3× latency advantage; hardest for quality |
-| `chain` | `search_artists` → `get_discography` | Dependent chaining via `await_job` |
-
-**Metrics**:
-
-- **Total latency / TTFR** — wall-clock time; async TTFR is the acknowledgment latency (near-zero vs tool execution time)
-- **Pass@1** — fraction of trials where `success_marker` appears in the final response
-- **Pass^k** — `pass@1 ^ k`; exposes compounding reliability cost that `pass@1` understates
-- **Job ID leaked** — regex check for 8-char hex IDs in assistant messages (protocol failure indicator)
-- **Synthesis quality / context awareness** — optional LLM-judge scores (0–5, Claude Sonnet)
 
 ---
 
