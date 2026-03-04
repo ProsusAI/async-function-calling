@@ -10,7 +10,7 @@ import time
 import pytest
 from unittest.mock import patch, MagicMock
 
-import app
+from conftest import app
 from conftest import make_mock_msg
 
 
@@ -31,7 +31,7 @@ class TestExceptionHandling:
         def boom(args):
             raise RuntimeError("network timeout")
 
-        with patch.dict(app.TOOL_FUNCTIONS, {"get_hotels": boom}):
+        with patch.dict(app.use_case.tool_functions, {"get_hotels": boom}):
             result = app.fire_tool_async("get_hotels", {"city": "mumbai"})
 
         job_id = json.loads(result)["job_id"]
@@ -46,7 +46,7 @@ class TestExceptionHandling:
         def always_fail(args):
             raise ValueError("bad city")
 
-        with patch.dict(app.TOOL_FUNCTIONS, {"get_hotels": always_fail}):
+        with patch.dict(app.use_case.tool_functions, {"get_hotels": always_fail}):
             raw = app.fire_tool_async("get_hotels", {"city": "atlantis"})
 
         job_id = json.loads(raw)["job_id"]
@@ -60,7 +60,7 @@ class TestExceptionHandling:
         def fail(args):
             raise Exception("something went wrong")
 
-        with patch.dict(app.TOOL_FUNCTIONS, {"get_flights": fail}):
+        with patch.dict(app.use_case.tool_functions, {"get_flights": fail}):
             app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "mumbai"})
 
         assert _wait_for_queue(1)
@@ -72,7 +72,7 @@ class TestExceptionHandling:
         def fail(args):
             raise RuntimeError("oops")
 
-        with patch.dict(app.TOOL_FUNCTIONS, {"get_activities": fail}):
+        with patch.dict(app.use_case.tool_functions, {"get_activities": fail}):
             app.fire_tool_async("get_activities", {"city": "mumbai"})
 
         assert _wait_for_queue(1)
@@ -85,11 +85,11 @@ class TestExceptionHandling:
             raise RuntimeError("fail")
 
         # Use patcher.start() so the mock stays active while background threads run
-        sleep_patcher = patch("tools.time.sleep")
+        sleep_patcher = patch("use_cases.travel.tools.time.sleep")
         sleep_patcher.start()
 
         try:
-            with patch.dict(app.TOOL_FUNCTIONS, {"get_flights": fail}):
+            with patch.dict(app.use_case.tool_functions, {"get_flights": fail}):
                 app.fire_tool_async("get_hotels", {"city": "mumbai"})   # succeeds
                 app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "mumbai"})  # fails
 
@@ -117,7 +117,7 @@ class TestFailedMessageFormat:
         app.results_queue.put((job_id, "get_hotels", {"city": "mumbai"}, None, "network error"))
 
         terminal = make_mock_msg(content="Sorry, something went wrong.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         injected = next(
@@ -135,7 +135,7 @@ class TestFailedMessageFormat:
         app.results_queue.put((job_id, "get_hotels", {"city": "mumbai"}, None, "timeout"))
 
         terminal = make_mock_msg(content="It failed.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         injected = next(
@@ -151,7 +151,7 @@ class TestFailedMessageFormat:
         app.results_queue.put((job_id, "get_flights", {}, None, "API error"))
 
         terminal = make_mock_msg(content="Search failed.")
-        with patch("app.call_openai", return_value=terminal):
+        with patch.object(app, "call_openai", return_value=terminal):
             app.check_and_inject([])
 
         assert job_id not in app.pending_tools

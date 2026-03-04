@@ -11,7 +11,7 @@ import threading
 import pytest
 from unittest.mock import patch
 
-import app
+from conftest import app
 
 
 def _wait_for_queue(count=1, timeout=3.0):
@@ -27,18 +27,26 @@ def _wait_for_queue(count=1, timeout=3.0):
 class TestQueueDeposit:
     """Background threads must deposit results into results_queue."""
 
+    # Helper: start a sleep patcher that stays active while background threads run.
+    # Using patcher.start()/stop() (not `with patch(...)`) because `with` exits before
+    # the spawned thread calls time.sleep.
+    def _start_sleep_patch(self):
+        p = patch("use_cases.travel.tools.time.sleep")
+        p.start()
+        return p
+
     def test_success_result_deposited(self):
         """After a slow tool completes, a success tuple appears in the queue."""
-        with patch("tools.time.sleep"):
+        p = self._start_sleep_patch()
+        try:
             result = app.fire_tool_async("get_hotels", {"city": "mumbai"})
+            job_id = json.loads(result)["job_id"]
+            assert _wait_for_queue(1), "No result appeared in queue within timeout"
+            item = app.results_queue.get_nowait()
+        finally:
+            p.stop()
 
-        job_id = json.loads(result)["job_id"]
-
-        assert _wait_for_queue(1), "No result appeared in queue within timeout"
-
-        item = app.results_queue.get_nowait()
         got_job_id, tool_name, tool_args, result_str, error = item
-
         assert got_job_id == job_id
         assert tool_name == "get_hotels"
         assert tool_args == {"city": "mumbai"}
@@ -47,43 +55,51 @@ class TestQueueDeposit:
 
     def test_five_tuple_structure(self):
         """Queue entry must be a 5-tuple: (job_id, tool_name, tool_args, result, error)."""
-        with patch("tools.time.sleep"):
+        p = self._start_sleep_patch()
+        try:
             app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "mumbai"})
-
-        assert _wait_for_queue(1)
-        item = app.results_queue.get_nowait()
+            assert _wait_for_queue(1)
+            item = app.results_queue.get_nowait()
+        finally:
+            p.stop()
         assert len(item) == 5, f"Expected 5-tuple, got {len(item)}-tuple"
 
     def test_success_has_none_error(self):
-        with patch("tools.time.sleep"):
+        p = self._start_sleep_patch()
+        try:
             app.fire_tool_async("get_activities", {"city": "amsterdam"})
-
-        assert _wait_for_queue(1)
-        _, _, _, result, error = app.results_queue.get_nowait()
+            assert _wait_for_queue(1)
+            _, _, _, result, error = app.results_queue.get_nowait()
+        finally:
+            p.stop()
         assert error is None
         assert result is not None
 
     def test_multiple_threads_all_deposit(self):
         """Three concurrent async tool calls must each deposit exactly one result."""
-        with patch("tools.time.sleep"):
+        p = self._start_sleep_patch()
+        try:
             app.fire_tool_async("get_hotels", {"city": "mumbai"})
             app.fire_tool_async("get_flights", {"origin": "tokyo", "destination": "amsterdam"})
             app.fire_tool_async("get_activities", {"city": "amsterdam"})
-
-        assert _wait_for_queue(3), "Not all 3 results appeared in queue"
-        items = []
-        while not app.results_queue.empty():
-            items.append(app.results_queue.get_nowait())
+            assert _wait_for_queue(3), "Not all 3 results appeared in queue"
+            items = []
+            while not app.results_queue.empty():
+                items.append(app.results_queue.get_nowait())
+        finally:
+            p.stop()
         assert len(items) == 3
 
     def test_tool_args_preserved_in_deposit(self):
         """The args deposited must exactly match what was passed to fire_tool_async."""
         args = {"city": "amsterdam", "tag": "couple"}
-        with patch("tools.time.sleep"):
+        p = self._start_sleep_patch()
+        try:
             app.fire_tool_async("get_activities", args)
-
-        assert _wait_for_queue(1)
-        _, _, deposited_args, _, _ = app.results_queue.get_nowait()
+            assert _wait_for_queue(1)
+            _, _, deposited_args, _, _ = app.results_queue.get_nowait()
+        finally:
+            p.stop()
         assert deposited_args == args
 
 
