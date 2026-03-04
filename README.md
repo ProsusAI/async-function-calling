@@ -207,6 +207,71 @@ engine = AsyncEngine(use_case, forced_sync=True)
 
 ---
 
+## MCP tools
+
+Any [MCP server](https://modelcontextprotocol.io) can be used as a tool source. `MCPClient` connects to the server, fetches its tool list, and returns each tool as a `Tool` instance ready to drop into a `UseCase`.
+
+Install the optional dependency first:
+
+```bash
+uv add mcp
+```
+
+### Connecting
+
+```python
+from core.mcp_client import MCPClient
+from mcp import StdioServerParameters
+
+# stdio — spawns a subprocess
+client = MCPClient(StdioServerParameters(command="uvx", args=["mcp-server-fetch"]))
+
+# HTTP — connects to a running MCP server
+client = MCPClient("http://localhost:8000/mcp")
+```
+
+### Building a use case from MCP tools
+
+```python
+from core import UseCase
+from core.mcp_client import MCPClient
+from mcp import StdioServerParameters
+
+with MCPClient(StdioServerParameters(command="uvx", args=["mcp-server-fetch"])) as client:
+    FetchUseCase = UseCase(
+        display_name="Web Fetch",
+        input_placeholder="Ask me to fetch a URL…",
+        system_prompt="You can fetch web pages. Use the fetch tool to retrieve content.",
+        tools=client.tools(is_async=True),  # MCP tools tend to be slow — run in BG threads
+    )
+```
+
+### `tools(is_async)` parameter
+
+| `is_async` | When to use |
+|---|---|
+| `True` (default) | Most MCP tools — they call external services and take time |
+| `False` | Only for MCP tools known to be instant (pure computation, local data) |
+
+### How it works
+
+`MCPClient` keeps the MCP session alive on a persistent background event loop (a daemon thread). Each wrapped tool's `fn` submits a `call_tool` coroutine to that loop and blocks only the calling thread — which, for `is_async=True` tools, is already a background thread spawned by `AsyncEngine`. The main thread and OpenAI loop are never blocked.
+
+```
+Engine background thread
+  → calls tool.fn(args)
+      → MCPClient._run(session.call_tool(...))   ← blocks this BG thread only
+          → MCP server executes the tool
+      → returns text result
+  → puts result in results_queue
+Engine injection thread
+  → injects result, calls OpenAI, pushes SSE event
+```
+
+MCP's `inputSchema` is already JSON Schema — the same format `Tool.parameters` expects — so no conversion is needed.
+
+---
+
 ## Hooks
 
 `UseCase` accepts an optional `hooks` parameter for observing and modifying tool calls without touching `core/`.
