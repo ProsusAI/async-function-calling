@@ -204,20 +204,35 @@ class AsyncEngine:
         return_answer_to_parent → done_event → AgentTool.wait(). The return value
         here is only used internally (e.g. by _run_injection for SSE push).
         """
-        self._step_count += 1
-        if self._step_count > self._max_steps:
-            log.warning("MAX STEPS (%d) reached — stopping recursion.", self._max_steps)
-            return ""
+        # max_steps is only enforced for sub-agents (done_event is set).
+        # The parent engine lives for the entire server session — a lifetime
+        # counter would silently stop tool processing after enough turns.
+        if self._done_event is not None:
+            self._step_count += 1
+            if self._step_count > self._max_steps:
+                log.warning("MAX STEPS (%d) reached — sub-agent giving up.", self._max_steps)
+                if not self._terminated:
+                    self._answer_box["answer"] = "Sub-agent exceeded maximum steps without completing."
+                    self._terminated = True
+                    self._done_event.set()
+                return ""
 
         tool_names = [tc.function.name for tc in (msg.tool_calls or [])]
         log.debug("HANDLE RESP  has_content=%s  tool_calls=%s", bool(msg.content), tool_names)
         self.messages.append(msg.model_dump(exclude_none=True))
 
-        # Only collect content from the FINAL response (no tool calls).
-        # Intermediate content ("I'll search for...") is intentionally dropped
-        # to prevent it leaking into the return value / parent tool result.
+        # Final response: no tool calls remaining.
         if not msg.tool_calls:
-            return msg.content or ""
+            content = msg.content or ""
+            # Sub-agent natural exit: the model returned content without calling
+            # return_answer_to_parent. Treat this as an implicit return — signal
+            # done_event with the content so the parent isn't left waiting 120s.
+            if self._done_event is not None and not self._terminated:
+                log.info("NATURAL EXIT  sub-agent auto-signaling with content")
+                self._answer_box["answer"] = content
+                self._terminated = True
+                self._done_event.set()
+            return content
 
         finished_with_answer = False
 
