@@ -12,10 +12,12 @@ from fastapi.staticfiles import StaticFiles
 from core import AsyncEngine
 from use_cases.travel import TravelUseCase
 from use_cases.music  import MusicUseCase
+from use_cases.multi  import MultiUseCase
 
 USE_CASES = {
     "travel": TravelUseCase,
     "music":  MusicUseCase,
+    "multi":  MultiUseCase,
 }
 
 # ---------------------------------------------------------------------------

@@ -36,8 +36,11 @@ class AsyncEngine:
         base = BASE_SYSTEM_PROMPTS[injection_mode]
         self._system_prompt = base + "\n\n---\n\n" + use_case.system_prompt
 
+        # Tool lookup: name → Tool (carries fn + is_async flag)
+        self._tool_map = {t.name: t for t in use_case.tools}
+
         # Full tool schema list: domain tools + framework-owned await_job
-        self._tools_schema = list(use_case.tool_schemas) + [AWAIT_JOB_SCHEMA]
+        self._tools_schema = [t.schema for t in use_case.tools] + [AWAIT_JOB_SCHEMA]
 
         # OpenAI client
         self._client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
@@ -78,7 +81,7 @@ class AsyncEngine:
     def fire_tool_async(self, tool_name: str, tool_args: dict) -> str:
         """Spawn a background thread for a slow tool. Returns job JSON immediately."""
         job_id = uuid.uuid4().hex[:8]
-        tool_fn = self.use_case.tool_functions[tool_name]
+        tool_fn = self._tool_map[tool_name].fn
         log.info("TOOL START  job=%s  tool=%s  args=%s", job_id, tool_name, json.dumps(tool_args))
 
         def run():
@@ -128,8 +131,8 @@ class AsyncEngine:
                 tool_args = json.loads(tc.function.arguments)
                 tool_call_id = tc.id
 
-                if tool_name in self.use_case.slow_tools:
-                    log.info("DISPATCH     slow tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                if tool_name in self._tool_map and self._tool_map[tool_name].is_async:
+                    log.info("DISPATCH     async tool=%s  args=%s", tool_name, json.dumps(tool_args))
                     content = self.fire_tool_async(tool_name, tool_args)
 
                 elif tool_name == "await_job":
@@ -157,8 +160,8 @@ class AsyncEngine:
                         })
 
                 else:
-                    log.info("DISPATCH     instant tool=%s  args=%s", tool_name, json.dumps(tool_args))
-                    content = self.use_case.tool_functions[tool_name](tool_args)
+                    log.info("DISPATCH     sync tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                    content = self._tool_map[tool_name].fn(tool_args)
                     preview = content[:80] + "..." if len(content) > 80 else content
                     log.debug("INSTANT RES  tool=%s  result=%r", tool_name, preview)
 

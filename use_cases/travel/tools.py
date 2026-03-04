@@ -2,6 +2,8 @@ import time
 import random
 import json
 
+from core.schema import Tool
+
 # ---------------------------------------------------------------------------
 # Tool implementations
 # ---------------------------------------------------------------------------
@@ -124,75 +126,58 @@ def get_flights(origin: str, destination: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Registry
+# Tool registry — sync/async declared per-tool, not in a separate set
 # ---------------------------------------------------------------------------
 
-SLOW_TOOLS: set[str] = {"get_hotels", "get_activities", "get_flights"}
-
-TOOL_FUNCTIONS: dict = {
-    "get_weather":    lambda args: get_weather(args["city"]),
-    "get_hotels":     lambda args: get_hotels(args["city"]),
-    "get_activities": lambda args: get_activities(args["city"], args.get("tag")),
-    "get_flights":    lambda args: get_flights(args["origin"], args["destination"]),
-}
-
-# ---------------------------------------------------------------------------
-# OpenAI schemas (no await_job — the framework appends it automatically)
-# ---------------------------------------------------------------------------
-
-TOOL_SCHEMAS: list[dict] = [
-    {
-        "type": "function",
-        "function": {
-            "name": "get_weather",
-            "description": "Get current weather for a city.",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string"}},
-                "required": ["city"],
-            },
+TOOLS: list[Tool] = [
+    Tool(
+        name="get_weather",
+        description="Get current weather for a city. Instant.",
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_hotels",
-            "description": "Get a list of hotels with area and cost per night. Supports: mumbai, amsterdam.",
-            "parameters": {
-                "type": "object",
-                "properties": {"city": {"type": "string", "description": "mumbai or amsterdam"}},
-                "required": ["city"],
-            },
+        fn=lambda args: get_weather(args["city"]),
+        is_async=False,
+    ),
+    Tool(
+        name="get_hotels",
+        description="Get a list of hotels with area and cost per night. Async. Supports: mumbai, amsterdam.",
+        parameters={
+            "type": "object",
+            "properties": {"city": {"type": "string", "description": "mumbai or amsterdam"}},
+            "required": ["city"],
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_activities",
-            "description": "Get activities for a city, optionally filtered by tag (couple, family, solo). Supports: mumbai, amsterdam.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "city": {"type": "string", "description": "mumbai or amsterdam"},
-                    "tag":  {"type": "string", "enum": ["couple", "family", "solo"], "description": "Optional filter"},
-                },
-                "required": ["city"],
+        fn=lambda args: get_hotels(args["city"]),
+        is_async=True,
+    ),
+    Tool(
+        name="get_activities",
+        description="Get activities for a city, optionally filtered by tag (couple, family, solo). Async. Supports: mumbai, amsterdam.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "city": {"type": "string", "description": "mumbai or amsterdam"},
+                "tag":  {"type": "string", "enum": ["couple", "family", "solo"], "description": "Optional filter"},
             },
+            "required": ["city"],
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_flights",
-            "description": "Get flight options. Supports routes: tokyo→mumbai, tokyo→amsterdam.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "origin":      {"type": "string", "description": "Departure city, e.g. tokyo"},
-                    "destination": {"type": "string", "description": "Arrival city, e.g. mumbai or amsterdam"},
-                },
-                "required": ["origin", "destination"],
+        fn=lambda args: get_activities(args["city"], args.get("tag")),
+        is_async=True,
+    ),
+    Tool(
+        name="get_flights",
+        description="Get flight options. Async. Supports routes: tokyo→mumbai, tokyo→amsterdam.",
+        parameters={
+            "type": "object",
+            "properties": {
+                "origin":      {"type": "string", "description": "Departure city, e.g. tokyo"},
+                "destination": {"type": "string", "description": "Arrival city, e.g. mumbai or amsterdam"},
             },
+            "required": ["origin", "destination"],
         },
-    },
+        fn=lambda args: get_flights(args["origin"], args["destination"]),
+        is_async=True,
+    ),
 ]

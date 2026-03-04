@@ -1,11 +1,13 @@
 """
 Music Discovery use case — tool implementations.
 
-Slow tools  (run in background threads): search_artists, get_discography, build_playlist
-Instant tools (inline):                  get_genre_info, get_mood_genres
+Async tools (fire-and-forget, background threads): search_artists, get_discography, build_playlist
+Sync tools  (inline, instant):                     get_genre_info, get_mood_genres
 """
 
 import time
+
+from core.schema import Tool
 
 # ---------------------------------------------------------------------------
 # Data
@@ -299,130 +301,115 @@ def get_mood_genres(args: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Framework wiring
+# Tool registry — sync/async declared per-tool, not in a separate set
 # ---------------------------------------------------------------------------
 
-SLOW_TOOLS = {"search_artists", "get_discography", "build_playlist"}
-
-TOOL_FUNCTIONS = {
-    "search_artists":  search_artists,
-    "get_discography": get_discography,
-    "build_playlist":  build_playlist,
-    "get_genre_info":  get_genre_info,
-    "get_mood_genres": get_mood_genres,
-}
-
-TOOL_SCHEMAS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "search_artists",
-            "description": (
-                "Search for artists by genre and/or listening mood. "
-                "Returns a ranked list with style and era info. "
-                "SLOW — dispatched in background. Provide genre, mood, or both."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "genre": {
-                        "type": "string",
-                        "description": "Music genre: jazz, electronic, classical, indie, hip-hop, ambient",
-                    },
-                    "mood": {
-                        "type": "string",
-                        "description": "Listening mood: study, workout, chill, party, sad, energetic, focus, creative, sleep",
-                    },
+TOOLS: list[Tool] = [
+    Tool(
+        name="search_artists",
+        description=(
+            "Search for artists by genre and/or listening mood. "
+            "Returns a ranked list with style and era info. "
+            "Async — dispatched in background. Provide genre, mood, or both."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "genre": {
+                    "type": "string",
+                    "description": "Music genre: jazz, electronic, classical, indie, hip-hop, ambient",
+                },
+                "mood": {
+                    "type": "string",
+                    "description": "Listening mood: study, workout, chill, party, sad, energetic, focus, creative, sleep",
                 },
             },
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_discography",
-            "description": (
-                "Fetch an artist's full album catalog and top tracks with ratings. "
-                "SLOW — use await_job if you plan to recommend specific records right after."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "artist": {
-                        "type": "string",
-                        "description": "Artist name exactly as returned by search_artists, e.g. 'Miles Davis'",
-                    },
+        fn=search_artists,
+        is_async=True,
+    ),
+    Tool(
+        name="get_discography",
+        description=(
+            "Fetch an artist's full album catalog and top tracks with ratings. "
+            "Async — use await_job if you plan to recommend specific records right after."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "artist": {
+                    "type": "string",
+                    "description": "Artist name exactly as returned by search_artists, e.g. 'Miles Davis'",
                 },
-                "required": ["artist"],
             },
+            "required": ["artist"],
         },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "build_playlist",
-            "description": (
-                "Curate a playlist for a theme and vibe. Returns an ordered tracklist. "
-                "SLOW — takes a few seconds. Use after you know what genre/mood the user wants."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "theme": {
-                        "type": "string",
-                        "description": "Playlist theme, e.g. 'late night jazz', 'rainy Sunday', 'morning run'",
-                    },
-                    "vibe": {
-                        "type": "string",
-                        "description": "Emotional tone: chill, energetic, melancholic, uplifting, focused, dreamy",
-                    },
-                    "length": {
-                        "type": "integer",
-                        "description": "Number of tracks (default 10, max 20)",
-                    },
+        fn=get_discography,
+        is_async=True,
+    ),
+    Tool(
+        name="build_playlist",
+        description=(
+            "Curate a playlist for a theme and vibe. Returns an ordered tracklist. "
+            "Async — use after you know what genre/mood the user wants."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "theme": {
+                    "type": "string",
+                    "description": "Playlist theme, e.g. 'late night jazz', 'rainy Sunday', 'morning run'",
                 },
-                "required": ["theme", "vibe"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_genre_info",
-            "description": (
-                "Instantly returns BPM range, defining characteristics, sub-genres, and listening tips "
-                "for a music genre. Use before or alongside search_artists to give context."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "genre": {
-                        "type": "string",
-                        "description": "Genre name: jazz, electronic, classical, indie, hip-hop, ambient",
-                    },
+                "vibe": {
+                    "type": "string",
+                    "description": "Emotional tone: chill, energetic, melancholic, uplifting, focused, dreamy",
                 },
-                "required": ["genre"],
-            },
-        },
-    },
-    {
-        "type": "function",
-        "function": {
-            "name": "get_mood_genres",
-            "description": (
-                "Instantly maps a listening mood to the best matching genres with reasoning. "
-                "Use this first when the user describes a mood rather than a genre."
-            ),
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "mood": {
-                        "type": "string",
-                        "description": "Listening mood: study, workout, chill, party, sad, energetic, focus, creative, sleep",
-                    },
+                "length": {
+                    "type": "integer",
+                    "description": "Number of tracks (default 10, max 20)",
                 },
-                "required": ["mood"],
             },
+            "required": ["theme", "vibe"],
         },
-    },
+        fn=build_playlist,
+        is_async=True,
+    ),
+    Tool(
+        name="get_genre_info",
+        description=(
+            "Instantly returns BPM range, defining characteristics, sub-genres, and listening tips "
+            "for a music genre. Use before or alongside search_artists to give context."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "genre": {
+                    "type": "string",
+                    "description": "Genre name: jazz, electronic, classical, indie, hip-hop, ambient",
+                },
+            },
+            "required": ["genre"],
+        },
+        fn=get_genre_info,
+        is_async=False,
+    ),
+    Tool(
+        name="get_mood_genres",
+        description=(
+            "Instantly maps a listening mood to the best matching genres with reasoning. "
+            "Use this first when the user describes a mood rather than a genre."
+        ),
+        parameters={
+            "type": "object",
+            "properties": {
+                "mood": {
+                    "type": "string",
+                    "description": "Listening mood: study, workout, chill, party, sad, energetic, focus, creative, sleep",
+                },
+            },
+            "required": ["mood"],
+        },
+        fn=get_mood_genres,
+        is_async=False,
+    ),
 ]

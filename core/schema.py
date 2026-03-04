@@ -3,6 +3,36 @@ from typing import Callable
 
 
 @dataclass
+class Tool:
+    """
+    A single tool available to an agent.
+
+    The sync/async distinction lives here — not in a separate set.
+      is_async=False  → runs inline, result returned immediately to the LLM
+      is_async=True   → fires in a background thread (fire-and-forget), result
+                        injected back into the conversation when ready
+    """
+
+    name: str
+    description: str
+    parameters: dict           # OpenAI function parameters schema
+    fn: Callable[[dict], str]  # takes the parsed args dict, returns a string result
+    is_async: bool = False
+
+    @property
+    def schema(self) -> dict:
+        """OpenAI function call schema for this tool."""
+        return {
+            "type": "function",
+            "function": {
+                "name": self.name,
+                "description": self.description,
+                "parameters": self.parameters,
+            },
+        }
+
+
+@dataclass
 class UseCase:
     """
     Contract for a use case plugged into AsyncEngine.
@@ -40,20 +70,9 @@ class UseCase:
       - Job-ID confidentiality rules   (owned by base)
     """
 
-    tool_schemas: list[dict]
+    tools: list[Tool]
     """
-    OpenAI function schemas for domain tools.
+    All tools available to this use case. Each Tool carries its name, schema,
+    implementation fn, and sync/async mode in one place.
     Do NOT include await_job — the engine appends it automatically.
-    """
-
-    tool_functions: dict[str, Callable]
-    """
-    Maps tool name -> callable(args: dict) -> str.
-    Do NOT include "await_job" — the engine handles it internally.
-    """
-
-    slow_tools: set[str]
-    """
-    Names of tools that run asynchronously (subset of tool_functions keys).
-    Instant tools (not in this set) run inline during handle_response().
     """
