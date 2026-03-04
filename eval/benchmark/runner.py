@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).parent))      # benchmark package (metrics
 from core.engine import AsyncEngine
 from metrics import TrialResult, check_job_id_leaked
 from scenarios import BenchScenario
-from sync_engine import SyncEngine
 
 _TIMEOUT = 30.0       # max seconds to wait for background tools
 _SIBLING_WAIT = 0.1   # brief window for parallel tools to land together
@@ -50,7 +49,7 @@ def run_trial(
         llm_judge_fn:  Optional callable(messages, response) → (float, float)
                        returning (synthesis_quality, context_awareness).
     """
-    is_sync = isinstance(engine, SyncEngine)
+    is_sync = engine._forced_sync
     engine._auto_inject = False  # benchmark drives injection; no background spawning
 
     # Count every call_openai() invocation for this trial.

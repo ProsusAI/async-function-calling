@@ -1,6 +1,6 @@
 from .engine import AsyncEngine
-from .sync_engine import SyncEngine
 from .schema import UseCase, Tool
 from .agent_tool import AgentTool
+from .return_answer import RETURN_ANSWER_SCHEMA
 
-__all__ = ["AsyncEngine", "SyncEngine", "UseCase", "Tool", "AgentTool"]
+__all__ = ["AsyncEngine", "UseCase", "Tool", "AgentTool", "RETURN_ANSWER_SCHEMA"]

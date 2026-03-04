@@ -11,42 +11,115 @@ from dotenv import load_dotenv
 
 from .await_job import AWAIT_JOB_SCHEMA
 from .prompts import BASE_SYSTEM_PROMPTS
+from .return_answer import RETURN_ANSWER_SCHEMA
 from .schema import UseCase
 
 load_dotenv()
 
 log = logging.getLogger("async_tools")
 
+# Synthesis-only base prompt: no async job-ID mechanics.
+# Used when forced_sync=True (no background threads, no job IDs).
+_FORCED_SYNC_BASE_PROMPT = (
+    "When tool results are available, proactively synthesise them with the "
+    "conversation context — do not wait for the user to ask \"which is best.\" "
+    "Filter and rank based on what you know: stated interests, companions, budget "
+    "signals, or other context from earlier in the conversation. Explain briefly "
+    "why the top picks fit their situation. Reserve a full flat list only when you "
+    "have no context to work with."
+)
+
+# Prepended to any sub-agent's system prompt (when done_event is provided).
+_SUBAGENT_PREAMBLE = (
+    "You are a specialist sub-agent invoked by an orchestrating agent.\n"
+    "Do NOT ask the user for clarification — work with the information given to you.\n"
+    "When your task is complete, you MUST call `return_answer_to_parent` with your "
+    "full synthesized answer. Do not stop without calling it."
+)
+
 
 class AsyncEngine:
     """
     Core async tool-calling engine.
 
-    Instantiated once with a UseCase and an injection_mode. Owns all
-    mutable conversation state and the OpenAI loop, async dispatch,
-    injection strategies, and SSE broadcast.
+    Can operate in three modes depending on constructor arguments:
+
+    Parent agent (done_event=None):
+      - Standard async tool dispatch with background threads and SSE injection.
+      - forced_sync=True: all tools run inline, no job IDs, no await_job.
+
+    Sub-agent (done_event provided):
+      - Has its own independent queue, pending_tools, and lock.
+      - Does NOT push SSE events (no _sse_loop attached).
+      - Adds `return_answer_to_parent` to its tool list.
+      - AgentTool blocks on done_event.wait() until the sub-agent calls that tool.
+      - forced_sync=True: sub-agent's own tools run inline (no internal parallelism).
     """
 
-    def __init__(self, use_case: UseCase, injection_mode: str = "tool", model: str = "gpt-4o"):
+    def __init__(
+        self,
+        use_case: UseCase,
+        injection_mode: str = "tool",
+        model: str = "gpt-4o",
+        forced_sync: bool = False,
+        done_event: "threading.Event | None" = None,
+        answer_box: "dict | None" = None,
+        max_steps: int = 20,
+    ):
         self.use_case = use_case
-        self.injection_mode = injection_mode
+        # Sub-agents always use "tool" injection mode internally.
+        self.injection_mode = "tool" if done_event is not None else injection_mode
         self.model = model
+        self._forced_sync = forced_sync
+        self._done_event = done_event
+        self._answer_box = answer_box if answer_box is not None else {}
+        self._max_steps = max_steps
+        self._step_count = 0
+        self._terminated = False
 
-        # Compose system prompt: base (async mechanics) + use-case (domain)
-        base = BASE_SYSTEM_PROMPTS[injection_mode]
-        self._system_prompt = base + "\n\n---\n\n" + use_case.system_prompt
+        # -----------------------------------------------------------------
+        # System prompt composition
+        # -----------------------------------------------------------------
+        is_subagent = done_event is not None
 
-        # Tool lookup: name → Tool (carries fn + is_async flag)
+        if is_subagent and forced_sync:
+            base = _FORCED_SYNC_BASE_PROMPT
+        elif is_subagent:
+            base = BASE_SYSTEM_PROMPTS["tool"]
+        elif forced_sync:
+            base = _FORCED_SYNC_BASE_PROMPT
+        else:
+            base = BASE_SYSTEM_PROMPTS[injection_mode]
+
+        if is_subagent:
+            self._system_prompt = (
+                _SUBAGENT_PREAMBLE + "\n\n---\n\n" + base + "\n\n---\n\n" + use_case.system_prompt
+            )
+        else:
+            self._system_prompt = base + "\n\n---\n\n" + use_case.system_prompt
+
+        # -----------------------------------------------------------------
+        # Tool schema: domain tools + framework-owned tools
+        # -----------------------------------------------------------------
         self._tool_map = {t.name: t for t in use_case.tools}
+        domain_schemas = [t.schema for t in use_case.tools]
 
-        # Full tool schema list: domain tools + framework-owned await_job
-        self._tools_schema = [t.schema for t in use_case.tools] + [AWAIT_JOB_SCHEMA]
+        framework_schemas = []
+        if is_subagent:
+            framework_schemas.append(RETURN_ANSWER_SCHEMA)
+            if not forced_sync:
+                framework_schemas.append(AWAIT_JOB_SCHEMA)
+        else:
+            if not forced_sync:
+                framework_schemas.append(AWAIT_JOB_SCHEMA)
+
+        self._tools_schema = domain_schemas + framework_schemas
 
         # OpenAI client
         self._client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
         # -----------------------------------------------------------------
-        # Mutable state (single-user demo)
+        # Mutable state
         # -----------------------------------------------------------------
         self.messages: list = [{"role": "system", "content": self._system_prompt}]
         self.pending_tools: dict = {}       # job_id -> {name, args}
@@ -54,13 +127,13 @@ class AsyncEngine:
         self._lock: threading.Lock = threading.Lock()
         self.deferred_hints: dict = {}      # job_id -> list[str] of follow-up hints
 
-        # SSE: one asyncio.Queue per connected browser tab
+        # SSE: one asyncio.Queue per connected browser tab.
+        # Sub-agents leave this None — push_event becomes a no-op.
         self._sse_loop: asyncio.AbstractEventLoop = None
         self._sse_clients: list = []
 
         # When False, background threads deposit results into the queue but do NOT
-        # auto-spawn _run_injection. Set to False in tests that inspect the queue
-        # directly to avoid a race between the injection thread and the test.
+        # auto-spawn _run_injection. Useful in tests to avoid injection races.
         self._auto_inject: bool = True
 
     # ------------------------------------------------------------------
@@ -75,13 +148,22 @@ class AsyncEngine:
                 self._sse_loop.call_soon_threadsafe(q.put_nowait, payload)
 
     # ------------------------------------------------------------------
-    # Async tool machinery
+    # Async / sync tool machinery
     # ------------------------------------------------------------------
 
     def fire_tool_async(self, tool_name: str, tool_args: dict) -> str:
-        """Spawn a background thread for a slow tool. Returns job JSON immediately."""
-        job_id = uuid.uuid4().hex[:8]
+        """Dispatch a tool marked is_async=True.
+
+        forced_sync=True  → run inline, return real result immediately.
+        forced_sync=False → spawn background thread, return job JSON immediately.
+        """
         tool_fn = self._tool_map[tool_name].fn
+
+        if self._forced_sync:
+            log.info("TOOL SYNC   tool=%s  args=%s", tool_name, json.dumps(tool_args))
+            return tool_fn(tool_args)
+
+        job_id = uuid.uuid4().hex[:8]
         log.info("TOOL START  job=%s  tool=%s  args=%s", job_id, tool_name, json.dumps(tool_args))
 
         def run():
@@ -116,62 +198,87 @@ class AsyncEngine:
         return msg
 
     def handle_response(self, msg) -> str:
-        """Process an OpenAI response. Returns the assistant text to display."""
+        """Process an OpenAI response. Returns the final assistant text to display.
+
+        For sub-agents this return value is NOT the answer — the answer flows via
+        return_answer_to_parent → done_event → AgentTool.wait(). The return value
+        here is only used internally (e.g. by _run_injection for SSE push).
+        """
+        self._step_count += 1
+        if self._step_count > self._max_steps:
+            log.warning("MAX STEPS (%d) reached — stopping recursion.", self._max_steps)
+            return ""
+
         tool_names = [tc.function.name for tc in (msg.tool_calls or [])]
         log.debug("HANDLE RESP  has_content=%s  tool_calls=%s", bool(msg.content), tool_names)
         self.messages.append(msg.model_dump(exclude_none=True))
 
-        collected = []
-        if msg.content:
-            collected.append(msg.content)
+        # Only collect content from the FINAL response (no tool calls).
+        # Intermediate content ("I'll search for...") is intentionally dropped
+        # to prevent it leaking into the return value / parent tool result.
+        if not msg.tool_calls:
+            return msg.content or ""
 
-        if msg.tool_calls:
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                tool_args = json.loads(tc.function.arguments)
-                tool_call_id = tc.id
+        finished_with_answer = False
 
-                if tool_name in self._tool_map and self._tool_map[tool_name].is_async:
-                    log.info("DISPATCH     async tool=%s  args=%s", tool_name, json.dumps(tool_args))
-                    content = self.fire_tool_async(tool_name, tool_args)
+        for tc in msg.tool_calls:
+            tool_name = tc.function.name
+            tool_args = json.loads(tc.function.arguments)
+            tool_call_id = tc.id
 
-                elif tool_name == "await_job":
-                    job_id = tool_args.get("job_id", "")
-                    hint   = tool_args.get("followup_hint", "")
-                    if job_id in self.pending_tools and hint:
-                        self.deferred_hints.setdefault(job_id, []).append(hint)
-                        log.info("AWAIT_JOB    registered  job=%s  hint=%r", job_id, hint)
-                        content = json.dumps({
-                            "status": "registered",
-                            "job_id": job_id,
-                            "message": "Follow-up intent recorded. You will be reminded when this job completes.",
-                        })
-                    else:
-                        reason = "job not in pending_tools" if job_id not in self.pending_tools else "empty hint"
-                        log.warning("AWAIT_JOB    REJECTED  job=%r  reason=%s  active_jobs=%s",
-                                    job_id, reason, list(self.pending_tools.keys()))
-                        content = json.dumps({
-                            "status": "error",
-                            "message": (
-                                f"No active job with id '{job_id}'. "
-                                "If this job already completed, its result is in the conversation — "
-                                "call the follow-up tool directly with that result."
-                            ),
-                        })
+            if tool_name == "return_answer_to_parent":
+                answer = tool_args.get("answer", "")
+                log.info("RETURN_ANSWER  preview=%r", answer[:80])
+                self._answer_box["answer"] = answer
+                self._terminated = True
+                if self._done_event is not None:
+                    self._done_event.set()
+                content = json.dumps({"status": "ok", "message": "Answer returned to parent."})
+                finished_with_answer = True
 
+            elif tool_name in self._tool_map and self._tool_map[tool_name].is_async:
+                log.info("DISPATCH     async tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                content = self.fire_tool_async(tool_name, tool_args)
+
+            elif tool_name == "await_job":
+                job_id = tool_args.get("job_id", "")
+                hint   = tool_args.get("followup_hint", "")
+                if job_id in self.pending_tools and hint:
+                    self.deferred_hints.setdefault(job_id, []).append(hint)
+                    log.info("AWAIT_JOB    registered  job=%s  hint=%r", job_id, hint)
+                    content = json.dumps({
+                        "status": "registered",
+                        "job_id": job_id,
+                        "message": "Follow-up intent recorded. You will be reminded when this job completes.",
+                    })
                 else:
-                    log.info("DISPATCH     sync tool=%s  args=%s", tool_name, json.dumps(tool_args))
-                    content = self._tool_map[tool_name].fn(tool_args)
-                    preview = content[:80] + "..." if len(content) > 80 else content
-                    log.debug("INSTANT RES  tool=%s  result=%r", tool_name, preview)
+                    reason = "job not in pending_tools" if job_id not in self.pending_tools else "empty hint"
+                    log.warning("AWAIT_JOB    REJECTED  job=%r  reason=%s  active_jobs=%s",
+                                job_id, reason, list(self.pending_tools.keys()))
+                    content = json.dumps({
+                        "status": "error",
+                        "message": (
+                            f"No active job with id '{job_id}'. "
+                            "If this job already completed, its result is in the conversation — "
+                            "call the follow-up tool directly with that result."
+                        ),
+                    })
 
-                self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
+            else:
+                log.info("DISPATCH     sync tool=%s  args=%s", tool_name, json.dumps(tool_args))
+                content = self._tool_map[tool_name].fn(tool_args)
+                preview = content[:80] + "..." if len(content) > 80 else content
+                log.debug("INSTANT RES  tool=%s  result=%r", tool_name, preview)
 
-            log.debug("FOLLOWUP     making follow-up OpenAI call after %d tool result(s)", len(msg.tool_calls))
-            followup = self.call_openai()
-            collected.append(self.handle_response(followup))
+            self.messages.append({"role": "tool", "tool_call_id": tool_call_id, "content": content})
 
-        return "\n\n".join(filter(None, collected))
+        # Do not recurse if the sub-agent has returned its answer.
+        if finished_with_answer:
+            return ""
+
+        log.debug("FOLLOWUP     making follow-up OpenAI call after %d tool result(s)", len(msg.tool_calls))
+        followup = self.call_openai()
+        return self.handle_response(followup)
 
     # ------------------------------------------------------------------
     # Injection strategies
@@ -291,21 +398,11 @@ class AsyncEngine:
     def check_and_inject(self, history=None):
         """Drain the results queue, inject all finished jobs, call OpenAI, return result.
 
-        Restores the method that existed in app.py (removed in the FastAPI migration)
-        so the test suite can exercise injection logic directly without going through
-        the threading machinery.
-
-        Args:
-            history: Optional list of message dicts. When provided, the assistant
-                     response is appended to it and the list is returned (backward-
-                     compatible with the old Gradio-era call signature). When None,
-                     returns the bot text string.
-
         Must be called with self._lock already held (or in a single-threaded test context).
         """
         finished = self.collect_finished_results()
         if not finished:
-            return history  # empty queue — return history unchanged (same object)
+            return history
         self._inject_finished(finished)
         response = self.call_openai()
         bot_text = self.handle_response(response)
@@ -315,7 +412,15 @@ class AsyncEngine:
 
     def _run_injection(self):
         """Called from a background thread when a job completes."""
+        # Guard: if the engine has been terminated (sub-agent called return_answer_to_parent
+        # while async tools were still running), skip injection entirely.
+        if self._terminated:
+            log.debug("INJECTION SKIPPED — engine terminated (dangling thread)")
+            return
+
         with self._lock:
+            if self._terminated:  # re-check after acquiring lock
+                return
             finished = self.collect_finished_results()
             if not finished:
                 return
@@ -336,3 +441,5 @@ class AsyncEngine:
             self.messages.append({"role": "system", "content": self._system_prompt})
             self.pending_tools.clear()
             self.deferred_hints.clear()
+            self._step_count = 0
+            self._terminated = False

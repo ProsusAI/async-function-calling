@@ -1,5 +1,12 @@
-"""Re-export SyncEngine from core for backward compatibility with benchmark scripts."""
+"""Backward-compat shim: SyncEngine is now AsyncEngine(forced_sync=True)."""
 
-from core.sync_engine import SyncEngine, _SYNC_BASE_PROMPT  # noqa: F401
+from core.engine import AsyncEngine as _AsyncEngine
+from core.schema import UseCase as _UseCase
 
-__all__ = ["SyncEngine", "_SYNC_BASE_PROMPT"]
+
+def SyncEngine(use_case: _UseCase, model: str = "gpt-4o") -> _AsyncEngine:
+    """Return an AsyncEngine running in forced_sync mode (all tools run inline)."""
+    return _AsyncEngine(use_case, forced_sync=True, model=model)
+
+
+__all__ = ["SyncEngine"]
