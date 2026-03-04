@@ -34,7 +34,10 @@ _SUBAGENT_PREAMBLE = (
     "You are a specialist sub-agent invoked by an orchestrating agent.\n"
     "Do NOT ask the user for clarification — work with the information given to you.\n"
     "When your task is complete, you MUST call `return_answer_to_parent` with your "
-    "full synthesized answer. Do not stop without calling it."
+    "full synthesized answer. Do not stop without calling it.\n"
+    "IMPORTANT: If you have background jobs still running (slow tools you dispatched), "
+    "do NOT call `return_answer_to_parent` yet — wait for those results to arrive and "
+    "include them in your final answer."
 )
 
 
@@ -224,14 +227,23 @@ class AsyncEngine:
         # Final response: no tool calls remaining.
         if not msg.tool_calls:
             content = msg.content or ""
-            # Sub-agent natural exit: the model returned content without calling
-            # return_answer_to_parent. Treat this as an implicit return — signal
-            # done_event with the content so the parent isn't left waiting 120s.
             if self._done_event is not None and not self._terminated:
-                log.info("NATURAL EXIT  sub-agent auto-signaling with content")
-                self._answer_box["answer"] = content
-                self._terminated = True
-                self._done_event.set()
+                if self.pending_tools:
+                    # Sub-agent still has background jobs running. Do NOT signal
+                    # done_event — the injection threads will re-enter handle_response
+                    # once those jobs complete, at which point the model can synthesize
+                    # properly and call return_answer_to_parent.
+                    log.info(
+                        "NATURAL EXIT with %d pending tool(s) — holding done_event: %s",
+                        len(self.pending_tools),
+                        list(self.pending_tools.keys()),
+                    )
+                else:
+                    # No pending jobs: treat natural exit as implicit return_answer_to_parent.
+                    log.info("NATURAL EXIT  sub-agent auto-signaling with content")
+                    self._answer_box["answer"] = content
+                    self._terminated = True
+                    self._done_event.set()
             return content
 
         finished_with_answer = False
@@ -242,14 +254,33 @@ class AsyncEngine:
             tool_call_id = tc.id
 
             if tool_name == "return_answer_to_parent":
-                answer = tool_args.get("answer", "")
-                log.info("RETURN_ANSWER  preview=%r", answer[:80])
-                self._answer_box["answer"] = answer
-                self._terminated = True
-                if self._done_event is not None:
-                    self._done_event.set()
-                content = json.dumps({"status": "ok", "message": "Answer returned to parent."})
-                finished_with_answer = True
+                if self.pending_tools:
+                    # Still have background jobs running — reject early return.
+                    # The injection threads will re-enter handle_response when those
+                    # jobs complete, at which point the model can return with real data.
+                    pending_names = [v["name"] for v in self.pending_tools.values()]
+                    log.info(
+                        "RETURN_ANSWER REJECTED — %d pending job(s): %s",
+                        len(self.pending_tools),
+                        pending_names,
+                    )
+                    content = json.dumps({
+                        "status": "wait",
+                        "message": (
+                            f"You have {len(self.pending_tools)} background job(s) still running "
+                            f"({', '.join(pending_names)}). Do NOT return yet — wait for those "
+                            "results to arrive, then synthesize and call return_answer_to_parent."
+                        ),
+                    })
+                else:
+                    answer = tool_args.get("answer", "")
+                    log.info("RETURN_ANSWER  preview=%r", answer[:80])
+                    self._answer_box["answer"] = answer
+                    self._terminated = True
+                    if self._done_event is not None:
+                        self._done_event.set()
+                    content = json.dumps({"status": "ok", "message": "Answer returned to parent."})
+                    finished_with_answer = True
 
             elif tool_name in self._tool_map and self._tool_map[tool_name].is_async:
                 log.info("DISPATCH     async tool=%s  args=%s", tool_name, json.dumps(tool_args))

@@ -155,7 +155,9 @@ AgentTool(
 This framework-owned tool is automatically added to every sub-agent's tool list. Sub-agents **must** call it to return their answer — the parent gets a timeout error string if the sub-agent exhausts `max_steps` without calling it.
 
 The sub-agent's system prompt is automatically prepended with:
-> *"You are a specialist sub-agent. Do NOT ask the user for clarification. When your task is complete, you MUST call `return_answer_to_parent`."*
+> *"You are a specialist sub-agent. Do NOT ask the user for clarification. When your task is complete, you MUST call `return_answer_to_parent`. If you have background jobs still running, do NOT call it yet — wait for those results to arrive and include them in your final answer."*
+
+**The framework enforces this at the engine level too.** If a sub-agent tries to call `return_answer_to_parent` (or exits naturally) while it still has pending background jobs, the call is rejected and the model is told to wait. Only when `pending_tools` is empty can a sub-agent successfully return. This prevents the sub-agent from prematurely returning a "looking for flights…" stub before the actual flight data arrives.
 
 ### Building a multi-agent use case
 
@@ -174,6 +176,19 @@ MultiUseCase = UseCase(
         AgentTool("travel_agent", "Travel specialist.", TravelUseCase, is_async=True),
     ],
 )
+```
+
+**Orchestrator prompt discipline — domain boundaries matter.** The orchestrator LLM decides which specialist to call based on the agent descriptions in your `system_prompt`. Overlapping descriptions cause misrouting — e.g. if `travel_agent` is described as handling "activities", a "jazz activities" query will go there instead of `music_agent`. Be explicit and non-overlapping:
+
+```
+music_agent:  ALL music content — artists, playlists, concerts, jazz events, venues.
+travel_agent: logistics ONLY — flights, hotels, weather. NOT music events.
+```
+
+Include concrete routing examples in the prompt for cross-domain queries:
+```
+"jazz trip to Amsterdam" → call BOTH: music_agent (jazz venues) AND travel_agent (flights + hotels).
+Call each agent at most once.
 ```
 
 Run it:
