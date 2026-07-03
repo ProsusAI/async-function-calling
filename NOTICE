@@ -1,0 +1,21 @@
+Async Tool-Calling Framework
+Copyright © 2026 MIH AI B.V.
+
+This product includes software developed at MIH AI B.V.
+Licensed under the Apache License, Version 2.0 (the "License").
+
+------------------------------------------------------------------------
+Third-party dependencies and their licenses
+------------------------------------------------------------------------
+
+This project depends on the following third-party packages. Attribution
+is provided as required by their respective licenses.
+
+- gradio          — Apache License 2.0
+- openai          — Apache License 2.0
+- python-dotenv   — BSD 3-Clause License
+- pytest          — MIT License        (dev dependency)
+- anthropic       — MIT License        (dev dependency)
+
+Each dependency remains the property of its respective copyright holders
+and is used in accordance with its license terms.
